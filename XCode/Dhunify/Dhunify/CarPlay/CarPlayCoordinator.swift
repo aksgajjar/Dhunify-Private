@@ -98,11 +98,6 @@ final class CarPlayCoordinator: NSObject {
     private let lastPlayedTemplate = CPListTemplate(title: "Last Played", sections: [])
     /// "Mashup" — 🔥 Bollywood Mashups list (moved out of Explore).
     private let mashupTemplate = CPListTemplate(title: "Mashup", sections: [])
-    /// "Mood" — 6-tile static grid. No dynamic mood logic.
-    private let moodTemplate = CPGridTemplate(title: "Mood", gridButtons: [])
-    /// "Explore" — Continue Mashup Session row (when detected).
-    /// Not in the tab bar; opened from Home grid.
-    private let exploreTemplate = CPListTemplate(title: "Explore", sections: [])
     /// "Library" — user playlists (renamed from Playlists, logic unchanged).
     private let libraryTemplate = CPListTemplate(title: "Library", sections: [])
     /// "Downloads" — offline songs from DownloadManager. Tapped rows
@@ -157,14 +152,6 @@ final class CarPlayCoordinator: NSObject {
         mashupTemplate.tabImage = UIImage(systemName: "waveform")
         mashupTemplate.emptyViewTitleVariants = ["Loading mashups…"]
 
-        moodTemplate.tabTitle = "Mood"
-        // Grid tiles are installed below via buildMoodGrid().
-
-        // Explore is NOT in the tab bar anymore — opened from Home grid.
-        exploreTemplate.tabTitle = "Explore"
-        exploreTemplate.tabImage = UIImage(systemName: "sparkles")
-        exploreTemplate.emptyViewTitleVariants = ["Nothing yet"]
-
         libraryTemplate.tabTitle = "Library"
         libraryTemplate.tabImage = UIImage(systemName: "music.note.list")
         libraryTemplate.emptyViewTitleVariants = ["No playlists"]
@@ -184,8 +171,8 @@ final class CarPlayCoordinator: NSObject {
             homeTemplate,
             lastPlayedTemplate,
             mashupTemplate,
-            moodTemplate,
             libraryTemplate,
+            downloadsTemplate,
         ])
 
         super.init()
@@ -198,20 +185,13 @@ final class CarPlayCoordinator: NSObject {
         homeTemplate.trailingNavigationBarButtons = [searchButton]
         lastPlayedTemplate.trailingNavigationBarButtons = [searchButton]
         mashupTemplate.trailingNavigationBarButtons = [searchButton]
-        moodTemplate.trailingNavigationBarButtons = [searchButton]
-        exploreTemplate.trailingNavigationBarButtons = [searchButton]
         libraryTemplate.trailingNavigationBarButtons = [searchButton]
         downloadsTemplate.trailingNavigationBarButtons = [searchButton]
-
-        // Mood — 6 static tiles. Built once; no dynamic logic.
-        buildMoodGrid()
 
         // Last Played — Resume row + Recents + Top Played. Sync from UserDefaults.
         refreshLastPlayed()
         observeLastPlayed()
 
-        // Explore — Continue Mashup Session row (when detected).
-        refreshExplore()
         // Mashup tab — 🔥 Bollywood Mashups loaded from three parallel queries.
         refreshMashup()
         loadMashups()
@@ -242,54 +222,6 @@ final class CarPlayCoordinator: NSObject {
     }
 
     // MARK: - Home tab
-
-    /// Mirrors the Explore-tab Continue-Mashup-Session detection. Used
-    /// by the Home grid to show an amber live-state dot on the Mashup
-    /// tile when a session is active. Keeps state logic in one shape
-    /// across surfaces.
-    private func hasContinueMashupSession() -> Bool {
-        let recents = RecentlyPlayedManager.shared.songs
-        guard !recents.isEmpty else { return false }
-        let mashupCount = recents.prefix(10).filter {
-            $0.title.lowercased().contains("mashup")
-        }.count
-        guard mashupCount >= 2 else { return false }
-        guard let hoursAgo = Self.lastPlayedHoursAgo(), hoursAgo < 24 else { return false }
-        return true
-    }
-
-    /// Creates + pushes a fresh CPListTemplate mirroring a tab's content.
-    /// Falls back to a placeholder row when the section set is empty so
-    /// the driver always sees a valid screen.
-    private func pushCloneList(
-        title: String,
-        sections: [CPListSection],
-        emptyText: String,
-        on controller: CPInterfaceController
-    ) {
-        let resolved: [CPListSection] = sections.isEmpty
-            ? [CPListSection(items: [Self.placeholderItem(text: emptyText)])]
-            : sections
-        let clone = CPListTemplate(title: title, sections: resolved)
-        clone.trailingNavigationBarButtons = [makeSearchButton()]
-        controller.pushTemplate(clone, animated: true) { _, error in
-            if let error {
-                coordinatorLogger.error("🚗 Home→\(title) push failed: \(error.localizedDescription)")
-            }
-        }
-    }
-
-    /// Fires resume playback via the same LastPlayedPersistence path the
-    /// Last Played tab's "Resume" row uses. No-op if nothing fresh is saved.
-    private func continueFromResume() {
-        guard let saved = LastPlayedPersistence.loadQueueIfFresh(),
-              !saved.queue.isEmpty,
-              saved.queue.indices.contains(saved.index) else {
-            coordinatorLogger.info("🚗 Continue tap — no fresh queue")
-            return
-        }
-        play(queue: saved.queue, startIndex: saved.index, seed: "Resume")
-    }
 
     /// Fresh search-button factory — each template needs its own
     /// CPBarButton instance (CPBarButton isn't safely sharable across
@@ -539,7 +471,6 @@ final class CarPlayCoordinator: NSObject {
             Task { @MainActor [weak self] in
                 self?.bumpTopPlayedIfNeeded()
                 self?.refreshLastPlayed()
-                self?.refreshExplore()
                 // Home Continue + Quick Picks sections depend on
                 // recents + last-played freshness — refresh so they
                 // stay current.
@@ -660,27 +591,6 @@ final class CarPlayCoordinator: NSObject {
         ("Throwback",  "90s bollywood hits",       "clock.arrow.circlepath"),
     ]
 
-    /// Builds the CPGridTemplate buttons once. Tap handler fires a
-    /// search + setQueue + play via the same path every other CarPlay
-    /// tap uses — no new playback surface.
-    private func buildMoodGrid() {
-        moodTemplate.updateGridButtons(computeMoodButtons())
-    }
-
-    /// Exposed button builder — Home grid's "Mood" shortcut pushes a
-    /// fresh CPGridTemplate clone using these buttons.
-    private func computeMoodButtons() -> [CPGridButton] {
-        Self.moodTiles.map { tile in
-            let icon = Self.moodTileImage(symbolName: tile.symbol)
-            return CPGridButton(
-                titleVariants: [tile.title],
-                image: icon
-            ) { [weak self] _ in
-                self?.playMoodTile(title: tile.title, query: tile.query)
-            }
-        }
-    }
-
     /// Renders a 88pt SF Symbol onto a 120×120 tinted square so every
     /// mood tile has identical visual weight. CarPlay requires a non-
     /// optional UIImage here — a symbol-only image without a background
@@ -739,35 +649,6 @@ final class CarPlayCoordinator: NSObject {
     /// the first section of Explore. Empty until `loadExploreMashups`
     /// completes.
     private var loadedMashups: [Song] = []
-
-    /// Rebuilds the Explore tab. Holds only the "Continue Mashup Session"
-    /// row when detected — Bollywood Mashups now live in the Mashup tab.
-    private func refreshExplore() {
-        let sections = computeExploreSections()
-        if sections.isEmpty {
-            exploreTemplate.updateSections([
-                CPListSection(items: [
-                    Self.placeholderItem(text: "Nothing to resume yet")
-                ])
-            ])
-        } else {
-            exploreTemplate.updateSections(sections)
-        }
-    }
-
-    /// Exposed section builder — Home grid's "Explore" shortcut pushes a
-    /// clone built from this.
-    private func computeExploreSections() -> [CPListSection] {
-        var sections: [CPListSection] = []
-        if let continueItem = continueMashupSessionItem() {
-            sections.append(CPListSection(
-                items: [continueItem],
-                header: "Continue",
-                sectionIndexTitle: nil
-            ))
-        }
-        return sections
-    }
 
     /// Rebuilds the Mashup tab from `loadedMashups`. Shows a placeholder
     /// until the first load completes.
@@ -924,71 +805,6 @@ final class CarPlayCoordinator: NSObject {
             return "\(total / 3600)h \((total % 3600) / 60)m"
         }
         return "\(max(1, total / 60)) min"
-    }
-
-    /// Builds the "▶ Continue Mashup Session" row if the user has been
-    /// actively listening to mashups. Detection:
-    ///   - Last 10 recents contain ≥2 titles with "mashup"
-    ///   - Last play was within 24h (via LastPlayedPersistence freshness)
-    /// Tap fires a fresh search + setQueue (never reuses old queue).
-    private func continueMashupSessionItem() -> CPListItem? {
-        let recents = RecentlyPlayedManager.shared.songs
-        guard !recents.isEmpty else { return nil }
-        let lastTen = recents.prefix(10)
-        let mashupCount = lastTen.filter {
-            $0.title.lowercased().contains("mashup")
-        }.count
-        guard mashupCount >= 2 else { return nil }
-
-        guard let hoursAgo = Self.lastPlayedHoursAgo(), hoursAgo < 24 else {
-            return nil
-        }
-
-        let subtitle = "Last played • \(hoursAgo <= 0 ? "just now" : "\(hoursAgo)h ago")"
-        let icon = UIImage(systemName: "play.circle.fill")
-        let item = CPListItem(
-            text: "▶ Continue Mashup Session",
-            detailText: subtitle,
-            image: icon
-        )
-        item.handler = { [weak self] _, completion in
-            self?.startMashupSession()
-            completion()
-        }
-        return item
-    }
-
-    /// Reads the profile-scoped `lastPlayedAt` timestamp written by
-    /// `LastPlayedPersistence.saveQueue` and returns whole-hours ago.
-    /// Returns nil if nothing has been saved yet.
-    private static func lastPlayedHoursAgo() -> Int? {
-        let profileID = ProfileManager.shared.currentProfile?.id.uuidString ?? "default"
-        let key = "dhunify.lastPlayed.\(profileID).lastPlayedAt"
-        let ts = UserDefaults.standard.double(forKey: key)
-        guard ts > 0 else { return nil }
-        let delta = Date().timeIntervalSince1970 - ts
-        guard delta >= 0 else { return 0 }
-        return Int(delta / 3600)
-    }
-
-    /// Fetches a fresh "bollywood mashup 2025" queue and plays it.
-    /// Does NOT reuse any existing queue — the user is starting a new
-    /// session on the same theme.
-    private func startMashupSession() {
-        Task { [weak self] in
-            guard let self else { return }
-            let useCase = AppContainer.shared.searchSongsUseCase
-            do {
-                let songs = try await useCase.execute(query: "bollywood mashup 2025")
-                let capped = Array(songs.prefix(20))
-                guard !capped.isEmpty else { return }
-                await MainActor.run {
-                    self.play(queue: capped, startIndex: 0, seed: "MashupSession")
-                }
-            } catch {
-                coordinatorLogger.error("🚗 Mashup session fetch failed: \(error.localizedDescription)")
-            }
-        }
     }
 
     // MARK: - Playlists
