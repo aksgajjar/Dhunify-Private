@@ -22,6 +22,11 @@ final class CarPlayNowPlayingUpdater {
     @ObservationIgnored private var isObserving: Bool = false
     @ObservationIgnored private var artworkTaskID: UUID?
     @ObservationIgnored private var lastArtworkSongID: String?
+    /// The artwork we last computed for the current song. PlayerViewModel
+    /// also writes `MPNowPlayingInfoCenter.nowPlayingInfo` and clears
+    /// the artwork slot when it does, so we re-assert this on every
+    /// observation tick to outlive the overwrite.
+    @ObservationIgnored private var currentArtwork: MPMediaItemArtwork?
 
     init(playerViewModel: PlayerViewModel) {
         self.playerViewModel = playerViewModel
@@ -47,12 +52,15 @@ final class CarPlayNowPlayingUpdater {
             _ = playerViewModel.isPlaying
             _ = playerViewModel.currentTime
             _ = playerViewModel.duration
+            _ = LibraryStore.shared.likedSongs
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
+                print("🎵 NowPlaying observation onChange fired")
                 self?.scheduleObservation()
             }
         }
         update()
+        refreshHeartButton()
     }
 
     // MARK: - Now Playing mirror
@@ -72,14 +80,34 @@ final class CarPlayNowPlayingUpdater {
         info[MPMediaItemPropertyPlaybackDuration] = playerViewModel.duration
         info[MPNowPlayingInfoPropertyPlaybackRate] = playerViewModel.isPlaying ? 1.0 : 0.0
 
+        // Inline re-assert. Protects against the case where our tick
+        // runs before PlayerViewModel's setupNowPlaying, which writes a
+        // fresh empty dict and clobbers everything else.
+        if let artwork = currentArtwork {
+            info[MPMediaItemPropertyArtwork] = artwork
+        }
+
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
 
         loadArtworkIfNeeded()
+
+        // Deferred re-assert on the next main-queue turn. Guarantees
+        // we land AFTER any synchronous VM write that happens later in
+        // this runloop pass — if VM wipes the artwork slot, this
+        // closure restores it a moment later.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let artwork = self.currentArtwork else { return }
+            var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+            info[MPMediaItemPropertyArtwork] = artwork
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+            print("🎵 Artwork reapplied:", self.currentArtwork != nil, "song=\(self.playerViewModel.currentSong?.title ?? "nil")")
+        }
     }
 
     private func loadArtworkIfNeeded() {
         guard let song = playerViewModel.currentSong else {
             lastArtworkSongID = nil
+            currentArtwork = nil
             return
         }
 
@@ -87,6 +115,14 @@ final class CarPlayNowPlayingUpdater {
         // changes — otherwise every periodic tick would re-download.
         guard lastArtworkSongID != song.youtubeID else { return }
         lastArtworkSongID = song.youtubeID
+
+        // Seed the Now Playing slot with the gradient fallback
+        // immediately so CarPlay never shows a blank artwork well while
+        // the real thumbnail is being fetched. Cached into
+        // `currentArtwork` so the next `update()` tick re-asserts it
+        // after any PlayerViewModel overwrite.
+        let fallback = Self.generateFallbackArtwork(for: song)
+        setCurrentArtwork(fallback)
 
         let taskID = UUID()
         artworkTaskID = taskID
@@ -99,12 +135,32 @@ final class CarPlayNowPlayingUpdater {
                 guard self.artworkTaskID == taskID else { return }
                 guard self.playerViewModel.currentSong?.youtubeID == song.youtubeID else { return }
 
-                let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-                var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-                info[MPMediaItemPropertyArtwork] = artwork
-                MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+                self.setCurrentArtwork(image)
             }
         }
+    }
+
+    /// Wraps the image in `MPMediaItemArtwork`, caches it locally so
+    /// `update()` can re-assert it, then pushes it into Now Playing
+    /// immediately. The artwork request handler rescales on demand so
+    /// CarPlay / Control Center / lock screen each get a crisp image
+    /// regardless of the bounds they request.
+    private func setCurrentArtwork(_ image: UIImage) {
+        let artwork = MPMediaItemArtwork(boundsSize: image.size) { requestedSize in
+            guard requestedSize.width > 0, requestedSize.height > 0 else { return image }
+            if requestedSize.width >= image.size.width &&
+                requestedSize.height >= image.size.height {
+                return image
+            }
+            let renderer = UIGraphicsImageRenderer(size: requestedSize)
+            return renderer.image { _ in
+                image.draw(in: CGRect(origin: .zero, size: requestedSize))
+            }
+        }
+        currentArtwork = artwork
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+        info[MPMediaItemPropertyArtwork] = artwork
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
     // MARK: - Artwork loading
@@ -182,5 +238,37 @@ final class CarPlayNowPlayingUpdater {
             )
             text.draw(in: textRect, withAttributes: attributes)
         }
+    }
+
+    // MARK: - Heart button
+
+    /// Installs (or refreshes) the heart `CPNowPlayingImageButton` on
+    /// `CPNowPlayingTemplate.shared`. The icon reflects whether the
+    /// current song is in `LibraryStore.shared.likedSongs`. Tapping
+    /// toggles the like state and re-fires this method so the icon
+    /// flips immediately.
+    ///
+    /// Apple's Now Playing template allows up to 5 image buttons. We
+    /// install exactly one — well within the cap.
+    private func refreshHeartButton() {
+        guard let song = playerViewModel.currentSong else {
+            CPNowPlayingTemplate.shared.updateNowPlayingButtons([])
+            return
+        }
+        let liked = LibraryStore.shared.isLiked(song)
+        let symbol = liked ? "heart.fill" : "heart"
+        let tint: UIColor = liked ? .systemPink : .white
+        let cfg = UIImage.SymbolConfiguration(pointSize: 36, weight: .semibold)
+        let img = UIImage(systemName: symbol, withConfiguration: cfg)?
+            .withTintColor(tint, renderingMode: .alwaysOriginal) ?? UIImage()
+        let button = CPNowPlayingImageButton(image: img) { _ in
+            Task { @MainActor in
+                _ = LibraryStore.shared.toggleLike(song)
+                // No explicit refresh needed — the observation in
+                // scheduleObservation() catches likedSongs change and
+                // re-fires refreshHeartButton via the loop.
+            }
+        }
+        CPNowPlayingTemplate.shared.updateNowPlayingButtons([button])
     }
 }
