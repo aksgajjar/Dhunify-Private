@@ -19,6 +19,10 @@ final class DownloadManager {
     var activeDownloads: Set<String> = []
     /// Download progress per song ID (0.0 – 1.0).
     var progress: [String: Double] = [:]
+    /// Bumped on every successful insert/delete so observers (CarPlay
+    /// Downloads tab) can refresh without polling. Counter only — observers
+    /// re-call fetchDownloaded() when this changes.
+    private(set) var downloadedVersion: Int = 0
 
     private let modelContainer: ModelContainer
     private var downloadTasks: [String: Task<Void, Never>] = [:]
@@ -129,6 +133,7 @@ final class DownloadManager {
             )
             context.insert(record)
             try context.save()
+            downloadedVersion &+= 1
 
             logger.info("⬇️ Downloaded: \(song.title) (\(fileSize / 1024)KB)")
 
@@ -169,6 +174,7 @@ final class DownloadManager {
         if let record = try? context.fetch(descriptor).first {
             context.delete(record)
             try? context.save()
+            downloadedVersion &+= 1
         }
 
         logger.info("🗑️ Deleted: \(downloaded.title)")
