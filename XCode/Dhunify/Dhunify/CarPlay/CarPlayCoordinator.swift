@@ -87,6 +87,7 @@ final class CarPlayCoordinator: NSObject {
     private weak var interfaceController: CPInterfaceController?
     private let playerViewModel: PlayerViewModel
     private let homeViewModel: HomeViewModel
+    private let container: AppContainer
 
     // MARK: - Templates
 
@@ -103,6 +104,10 @@ final class CarPlayCoordinator: NSObject {
     private let exploreTemplate = CPListTemplate(title: "Explore", sections: [])
     /// "Library" — user playlists (renamed from Playlists, logic unchanged).
     private let libraryTemplate = CPListTemplate(title: "Library", sections: [])
+    /// "Downloads" — offline songs from DownloadManager. Tapped rows
+    /// play directly from the local file URL (PlayerViewModel honours
+    /// `Song.localFileURL` automatically — no new playback path).
+    private let downloadsTemplate = CPListTemplate(title: "Downloads", sections: [])
 
     /// Root tab bar — constructed once and handed to
     /// `CPInterfaceController.setRootTemplate` exactly once.
@@ -136,6 +141,7 @@ final class CarPlayCoordinator: NSObject {
         self.interfaceController = interfaceController
         self.playerViewModel = container.playerViewModel
         self.homeViewModel = container.homeViewModel
+        self.container = container
 
         homeTemplate.tabTitle = "Home"
         homeTemplate.tabImage = UIImage(systemName: "house.fill")
@@ -161,6 +167,11 @@ final class CarPlayCoordinator: NSObject {
         libraryTemplate.tabImage = UIImage(systemName: "music.note.list")
         libraryTemplate.emptyViewTitleVariants = ["No playlists"]
         libraryTemplate.emptyViewSubtitleVariants = ["Create a playlist on your phone to see it here"]
+
+        downloadsTemplate.tabTitle = "Downloads"
+        downloadsTemplate.tabImage = UIImage(systemName: "arrow.down.circle.fill")
+        downloadsTemplate.emptyViewTitleVariants = ["No downloads yet"]
+        downloadsTemplate.emptyViewSubtitleVariants = ["Your downloaded content will appear here"]
 
         // Each list template gets a magnifying-glass nav-bar button that
         // pushes a CPListTemplate-based "Search" screen (Recent +
@@ -188,6 +199,7 @@ final class CarPlayCoordinator: NSObject {
         moodTemplate.trailingNavigationBarButtons = [searchButton]
         exploreTemplate.trailingNavigationBarButtons = [searchButton]
         libraryTemplate.trailingNavigationBarButtons = [searchButton]
+        downloadsTemplate.trailingNavigationBarButtons = [searchButton]
 
         // Home — 6 static shortcut tiles.
         buildHomeGrid()
@@ -215,6 +227,10 @@ final class CarPlayCoordinator: NSObject {
         // Library (was Playlists) — sync from UserDefaults via PlaylistManager.
         refreshPlaylists()
         observePlaylists()
+
+        // Downloads — local files from DownloadManager.
+        refreshDownloads()
+        observeDownloads()
     }
 
     deinit {
@@ -1421,6 +1437,48 @@ final class CarPlayCoordinator: NSObject {
                 coordinatorLogger.error("🚗 recent-search failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    // MARK: - Downloads tab
+
+    /// Re-registers `withObservationTracking` so the Downloads tab refreshes
+    /// whenever `DownloadManager.downloadedVersion` bumps (after any
+    /// insert or delete). Counter pattern — observers re-call
+    /// `fetchDownloaded()` on change.
+    private func observeDownloads() {
+        withObservationTracking {
+            _ = container.downloadManager.downloadedVersion
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.refreshDownloads()
+                self?.observeDownloads()
+            }
+        }
+    }
+
+    private func refreshDownloads() {
+        let sections = computeDownloadsSections()
+        if sections.isEmpty {
+            downloadsTemplate.updateSections([
+                CPListSection(items: [
+                    Self.placeholderItem(text: "Your downloaded content will appear here")
+                ])
+            ])
+        } else {
+            downloadsTemplate.updateSections(sections)
+        }
+    }
+
+    private func computeDownloadsSections() -> [CPListSection] {
+        let downloaded = container.downloadManager.fetchDownloaded()
+        guard !downloaded.isEmpty else { return [] }
+        let songs = downloaded.map { $0.toSong() }
+        let items = makeListItems(from: songs, seed: "Downloads")
+        return [CPListSection(
+            items: items,
+            header: "Downloaded (\(songs.count))",
+            sectionIndexTitle: nil
+        )]
     }
 }
 
