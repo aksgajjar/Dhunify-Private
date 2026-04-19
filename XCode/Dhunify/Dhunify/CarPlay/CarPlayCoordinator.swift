@@ -195,7 +195,7 @@ final class CarPlayCoordinator: NSObject {
         // Mood — 6 static tiles. Built once; no dynamic logic.
         buildMoodGrid()
 
-        // Drive — Resume row + Recents + Top Played. Sync from UserDefaults.
+        // Last Played — Resume row + Recents + Top Played. Sync from UserDefaults.
         refreshLastPlayed()
         observeLastPlayed()
 
@@ -531,7 +531,7 @@ final class CarPlayCoordinator: NSObject {
     }
 
     /// Fires resume playback via the same LastPlayedPersistence path the
-    /// Drive tab's "Resume" row uses. No-op if nothing fresh is saved.
+    /// Last Played tab's "Resume" row uses. No-op if nothing fresh is saved.
     private func continueFromResume() {
         guard let saved = LastPlayedPersistence.loadQueueIfFresh(),
               !saved.queue.isEmpty,
@@ -551,7 +551,7 @@ final class CarPlayCoordinator: NSObject {
         }
     }
 
-    // MARK: - Drive tab
+    // MARK: - Last Played tab
 
     /// UserDefaults key for the per-song play-count dictionary that
     /// powers the "Top Played" section. Lives here (not on a shared
@@ -564,7 +564,7 @@ final class CarPlayCoordinator: NSObject {
     /// (iOS dedupes, so the ID doesn't flip — no increment needed).
     private var lastRecentHeadID: String?
 
-    /// Re-registers `withObservationTracking` so the Drive tab refreshes
+    /// Re-registers `withObservationTracking` so the Last Played tab refreshes
     /// whenever a new song is added to RecentlyPlayedManager. Also bumps
     /// the play counter for the newly-prepended song.
     private func observeLastPlayed() {
@@ -610,9 +610,9 @@ final class CarPlayCoordinator: NSObject {
         }
     }
 
-    /// Builds the Last Played tab sections fresh. Exposed so Home grid's "Drive"
-    /// button can push a standalone clone — CarPlay templates can only
-    /// live in one place, so shortcuts need their own instance.
+    /// Builds the Last Played tab sections fresh. Exposed so Home grid's
+    /// Last Played shortcut can push a standalone clone — CarPlay templates
+    /// can only live in one place, so shortcuts need their own instance.
     private func computeLastPlayedSections() -> [CPListSection] {
         var sections: [CPListSection] = []
 
