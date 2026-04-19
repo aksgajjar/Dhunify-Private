@@ -91,8 +91,9 @@ final class CarPlayCoordinator: NSObject {
 
     // MARK: - Templates
 
-    /// "Home" — top-level 6-tile grid with shortcut buttons. First tab.
-    private let homeTemplate = CPGridTemplate(title: "Home", gridButtons: [])
+    /// "Home" — YT-Music-style sectioned list (Continue / Speed Dial /
+    /// Quick Picks / Mood / Trending / Latest Hindi). First tab.
+    private let homeTemplate = CPListTemplate(title: "Home", sections: [])
     /// "Last Played" — Resume row + Recently Played + Top Played.
     private let lastPlayedTemplate = CPListTemplate(title: "Last Played", sections: [])
     /// "Mashup" — 🔥 Bollywood Mashups list (moved out of Explore).
@@ -145,6 +146,7 @@ final class CarPlayCoordinator: NSObject {
 
         homeTemplate.tabTitle = "Home"
         homeTemplate.tabImage = UIImage(systemName: "house.fill")
+        homeTemplate.emptyViewTitleVariants = ["Loading…"]
 
         lastPlayedTemplate.tabTitle = "Last Played"
         lastPlayedTemplate.tabImage = UIImage(systemName: "clock.arrow.circlepath")
@@ -201,9 +203,6 @@ final class CarPlayCoordinator: NSObject {
         libraryTemplate.trailingNavigationBarButtons = [searchButton]
         downloadsTemplate.trailingNavigationBarButtons = [searchButton]
 
-        // Home — 6 static shortcut tiles.
-        buildHomeGrid()
-
         // Mood — 6 static tiles. Built once; no dynamic logic.
         buildMoodGrid()
 
@@ -224,6 +223,10 @@ final class CarPlayCoordinator: NSObject {
             await self?.homeViewModel.loadAll()
         }
 
+        // Home — sectioned list, observation-driven.
+        refreshHome()
+        observeHome()
+
         // Library (was Playlists) — sync from UserDefaults via PlaylistManager.
         refreshPlaylists()
         observePlaylists()
@@ -240,71 +243,6 @@ final class CarPlayCoordinator: NSObject {
 
     // MARK: - Home tab
 
-    /// Fixed 6-shortcut grid. Signature-Glow treatment (option A):
-    /// every tile shares a dark graphite base and differs only by the
-    /// radial glow color behind its glyph. Symbols picked for clarity
-    /// (option D) — richer, more readable at a glance than the old set.
-    private static let homeTiles: [(title: String, symbol: String, action: HomeAction, glow: UIColor)] = [
-        ("Continue", "play.circle.fill",         .continueResume,
-         UIColor(red: 1.00, green: 0.28, blue: 0.32, alpha: 1)),   // red
-        ("Mashup",   "music.note.list",          .openMashup,
-         UIColor(red: 0.68, green: 0.35, blue: 0.96, alpha: 1)),   // purple
-        ("Drive",    "steeringwheel",            .openDrive,
-         UIColor(red: 0.30, green: 0.60, blue: 1.00, alpha: 1)),   // blue
-        ("Mood",     "heart.circle.fill",        .openMood,
-         UIColor(red: 1.00, green: 0.40, blue: 0.66, alpha: 1)),   // pink
-        ("Explore",  "safari.fill",              .openExplore,
-         UIColor(red: 1.00, green: 0.70, blue: 0.20, alpha: 1)),   // amber
-        ("Library",  "rectangle.stack.fill",     .openLibrary,
-         UIColor(red: 0.30, green: 0.85, blue: 0.55, alpha: 1)),   // green
-    ]
-
-    private enum HomeAction {
-        case continueResume
-        case openMashup
-        case openDrive
-        case openMood
-        case openExplore
-        case openLibrary
-    }
-
-    private func buildHomeGrid() {
-        let hasResume = LastPlayedPersistence.loadQueueIfFresh() != nil
-        let hasMashupSession = hasContinueMashupSession()
-
-        let buttons: [CPGridButton] = Self.homeTiles.map { tile in
-            // Live-state dot per tile (option 5). Only dynamic actions
-            // get a colored indicator; the rest render without a dot.
-            let dotColor: UIColor? = {
-                switch tile.action {
-                case .continueResume:
-                    return hasResume
-                        ? UIColor(red: 0.30, green: 0.85, blue: 0.45, alpha: 1)
-                        : nil
-                case .openMashup:
-                    return hasMashupSession
-                        ? UIColor(red: 1.00, green: 0.70, blue: 0.20, alpha: 1)
-                        : nil
-                default:
-                    return nil
-                }
-            }()
-            let icon = Self.homeTileImage(
-                symbolName: tile.symbol,
-                glowColor: tile.glow,
-                dotColor: dotColor
-            )
-            let action = tile.action
-            return CPGridButton(
-                titleVariants: [tile.title],
-                image: icon
-            ) { [weak self] _ in
-                self?.handleHomeTile(action)
-            }
-        }
-        homeTemplate.updateGridButtons(buttons)
-    }
-
     /// Mirrors the Explore-tab Continue-Mashup-Session detection. Used
     /// by the Home grid to show an amber live-state dot on the Mashup
     /// tile when a session is active. Keeps state logic in one shape
@@ -318,211 +256,6 @@ final class CarPlayCoordinator: NSObject {
         guard mashupCount >= 2 else { return false }
         guard let hoursAgo = Self.lastPlayedHoursAgo(), hoursAgo < 24 else { return false }
         return true
-    }
-
-    /// Renders a Signature-Glow home tile (options A+D+1+2+3+4+5):
-    ///   • rounded 28pt corner square, 160×160
-    ///   • graphite vertical gradient base (unified across tiles)
-    ///   • STUDIO LIGHTING — radial glow offset to upper-center so the
-    ///     tile reads as lit from above; bottom inner shadow for depth
-    ///   • HAIRLINE BORDER — 0.5pt white@10% stroke separating tile
-    ///     from the dark CarPlay canvas
-    ///   • Top inner highlight (1.5pt white@22%) for glass feel
-    ///   • GLYPH DROP-HALO — soft accent-colored shadow under the glyph
-    ///     so the icon reads as lit-from-within rather than stamped on
-    ///   • DUOTONE GLYPH — palette config `[white, glow@75%]`; icons
-    ///     with two render layers pick up the accent on the secondary
-    ///     layer, single-layer symbols fall back to white
-    ///   • LIVE-STATE DOT — optional 14pt accent circle in the top-
-    ///     right corner for dynamic actions (Continue/Mashup)
-    /// Grid buttons are the only per-tile styling lever CarPlay exposes,
-    /// so the image does all the visual heavy-lifting.
-    private static func homeTileImage(
-        symbolName: String,
-        glowColor: UIColor,
-        dotColor: UIColor? = nil
-    ) -> UIImage {
-        let size = CGSize(width: 160, height: 160)
-        let renderer = UIGraphicsImageRenderer(size: size)
-        return renderer.image { ctx in
-            let cg = ctx.cgContext
-            let rect = CGRect(origin: .zero, size: size)
-            let path = UIBezierPath(roundedRect: rect, cornerRadius: 28)
-            let space = CGColorSpaceCreateDeviceRGB()
-
-            cg.saveGState()
-            cg.addPath(path.cgPath)
-            cg.clip()
-
-            // 1. Graphite base — unified dark gradient.
-            let baseTop = UIColor(red: 0.18, green: 0.19, blue: 0.22, alpha: 1)
-            let baseBottom = UIColor(red: 0.07, green: 0.08, blue: 0.10, alpha: 1)
-            if let grad = CGGradient(
-                colorsSpace: space,
-                colors: [baseTop.cgColor, baseBottom.cgColor] as CFArray,
-                locations: [0, 1]
-            ) {
-                cg.drawLinearGradient(
-                    grad,
-                    start: .zero,
-                    end: CGPoint(x: 0, y: size.height),
-                    options: []
-                )
-            }
-
-            // 2. Studio-lighting radial glow — shifted to the upper
-            //    third so the glow reads as top-lit (physical light
-            //    source above-camera). Slightly wider + brighter than
-            //    the old centered version.
-            let glowColors = [
-                glowColor.withAlphaComponent(0.70).cgColor,
-                glowColor.withAlphaComponent(0.28).cgColor,
-                glowColor.withAlphaComponent(0.0).cgColor,
-            ]
-            if let radial = CGGradient(
-                colorsSpace: space,
-                colors: glowColors as CFArray,
-                locations: [0, 0.55, 1]
-            ) {
-                let lightCenter = CGPoint(x: size.width / 2, y: size.height * 0.38)
-                cg.drawRadialGradient(
-                    radial,
-                    startCenter: lightCenter,
-                    startRadius: 0,
-                    endCenter: lightCenter,
-                    endRadius: size.width * 0.68,
-                    options: []
-                )
-            }
-
-            // 3. Bottom inner shadow — vertical fade to black over the
-            //    lower half, reinforcing the top-lit feel.
-            let shadowColors = [
-                UIColor.black.withAlphaComponent(0.0).cgColor,
-                UIColor.black.withAlphaComponent(0.35).cgColor,
-            ]
-            if let shadow = CGGradient(
-                colorsSpace: space,
-                colors: shadowColors as CFArray,
-                locations: [0, 1]
-            ) {
-                cg.drawLinearGradient(
-                    shadow,
-                    start: CGPoint(x: 0, y: size.height * 0.55),
-                    end: CGPoint(x: 0, y: size.height),
-                    options: []
-                )
-            }
-
-            cg.restoreGState()
-
-            // 4. Hairline outer border — 0.5pt white@10%, inset by
-            //    half the stroke width so the line sits cleanly on
-            //    the rounded rect edge.
-            let borderRect = rect.insetBy(dx: 0.25, dy: 0.25)
-            let border = UIBezierPath(roundedRect: borderRect, cornerRadius: 28)
-            UIColor.white.withAlphaComponent(0.10).setStroke()
-            border.lineWidth = 0.5
-            border.stroke()
-
-            // 5. Top hairline highlight for glass feel.
-            let inset: CGFloat = 14
-            let highlight = UIBezierPath()
-            highlight.move(to: CGPoint(x: inset, y: 3))
-            highlight.addLine(to: CGPoint(x: size.width - inset, y: 3))
-            UIColor.white.withAlphaComponent(0.22).setStroke()
-            highlight.lineWidth = 1.5
-            highlight.lineCapStyle = .round
-            highlight.stroke()
-
-            // 6. Duotone SF Symbol with glyph drop-halo.
-            //    Palette: primary white + secondary accent@75%. Single-
-            //    layer symbols fall back to monochrome white.
-            let baseCfg = UIImage.SymbolConfiguration(pointSize: 72, weight: .bold)
-            let palette = UIImage.SymbolConfiguration(paletteColors: [
-                .white,
-                glowColor.withAlphaComponent(0.75)
-            ])
-            let config = baseCfg.applying(palette)
-            if let icon = UIImage(systemName: symbolName, withConfiguration: config) {
-                let iconRect = CGRect(
-                    x: (size.width - icon.size.width) / 2,
-                    y: (size.height - icon.size.height) / 2,
-                    width: icon.size.width,
-                    height: icon.size.height
-                )
-                cg.saveGState()
-                // Accent halo — soft blur under the glyph. Renders as
-                // a lit-from-within feel matched to the tile glow.
-                cg.setShadow(
-                    offset: .zero,
-                    blur: 18,
-                    color: glowColor.withAlphaComponent(0.85).cgColor
-                )
-                icon.draw(in: iconRect)
-                cg.restoreGState()
-            }
-
-            // 7. Live-state dot — top-right corner, accent-colored,
-            //    white inner ring for contrast, soft matching blur so
-            //    it reads as a glowing indicator.
-            if let dotColor {
-                let dotSize: CGFloat = 14
-                let dotRect = CGRect(
-                    x: size.width - dotSize - 12,
-                    y: 12,
-                    width: dotSize,
-                    height: dotSize
-                )
-                cg.saveGState()
-                cg.setShadow(
-                    offset: .zero,
-                    blur: 8,
-                    color: dotColor.withAlphaComponent(0.9).cgColor
-                )
-                dotColor.setFill()
-                UIBezierPath(ovalIn: dotRect).fill()
-                cg.restoreGState()
-
-                let ring = UIBezierPath(ovalIn: dotRect.insetBy(dx: -1, dy: -1))
-                UIColor.white.withAlphaComponent(0.85).setStroke()
-                ring.lineWidth = 1.2
-                ring.stroke()
-            }
-        }
-    }
-
-    /// Routes each Home grid tap. For navigation tiles we push a fresh
-    /// clone template (CarPlay templates can only appear in one location
-    /// — pushing a tab template as child is invalid). Continue fires
-    /// resume playback directly.
-    private func handleHomeTile(_ action: HomeAction) {
-        guard let controller = interfaceController else { return }
-        switch action {
-        case .continueResume:
-            continueFromResume()
-        case .openMashup:
-            pushCloneList(title: "Mashup", sections: computeMashupSections(),
-                          emptyText: "Loading mashups…", on: controller)
-        case .openDrive:
-            pushCloneList(title: "Last Played", sections: computeLastPlayedSections(),
-                          emptyText: "Play a song to see it here", on: controller)
-        case .openMood:
-            let clone = CPGridTemplate(title: "Mood", gridButtons: computeMoodButtons())
-            clone.trailingNavigationBarButtons = [makeSearchButton()]
-            controller.pushTemplate(clone, animated: true) { _, error in
-                if let error {
-                    coordinatorLogger.error("🚗 Home→Mood push failed: \(error.localizedDescription)")
-                }
-            }
-        case .openExplore:
-            pushCloneList(title: "Explore", sections: computeExploreSections(),
-                          emptyText: "Nothing to resume yet", on: controller)
-        case .openLibrary:
-            pushCloneList(title: "Library", sections: computeLibrarySections(),
-                          emptyText: "Create a playlist on your phone to see it here",
-                          on: controller)
-        }
     }
 
     /// Creates + pushes a fresh CPListTemplate mirroring a tab's content.
@@ -567,6 +300,222 @@ final class CarPlayCoordinator: NSObject {
         }
     }
 
+    // MARK: - Home tab — YT-Music-style sectioned list
+
+    /// Re-registers `withObservationTracking` so the Home tab refreshes
+    /// whenever any of its data sources change.
+    private func observeHome() {
+        withObservationTracking {
+            _ = RecentlyPlayedManager.shared.songs
+            _ = PlaylistManager.shared.playlists
+            _ = LibraryStore.shared.likedSongs
+            _ = homeViewModel.sections
+            _ = homeViewModel.latestHindi
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.refreshHome()
+                self?.observeHome()
+            }
+        }
+    }
+
+    private func refreshHome() {
+        let sections = computeHomeSections()
+        if sections.isEmpty {
+            homeTemplate.updateSections([
+                CPListSection(items: [
+                    Self.placeholderItem(text: "Loading…")
+                ])
+            ])
+        } else {
+            homeTemplate.updateSections(sections)
+        }
+    }
+
+    private func computeHomeSections() -> [CPListSection] {
+        var sections: [CPListSection] = []
+
+        // 1. Continue — single row when LastPlayedPersistence has a fresh queue.
+        if let saved = LastPlayedPersistence.loadQueueIfFresh(),
+           !saved.queue.isEmpty,
+           saved.queue.indices.contains(saved.index) {
+            let current = saved.queue[saved.index]
+            let item = CPListItem(
+                text: Self.cleanTitle(current.title),
+                detailText: "Resume • \(current.artist)"
+            )
+            Self.loadImage(from: current.thumbnailURL, into: item)
+            let queue = saved.queue
+            let idx = saved.index
+            item.handler = { [weak self] _, completion in
+                self?.play(queue: queue, startIndex: idx, seed: "Resume")
+                completion()
+            }
+            sections.append(CPListSection(items: [item], header: "Continue", sectionIndexTitle: nil))
+        }
+
+        // 2. Speed Dial — Liked tile + first 6 user playlists. Always shown.
+        sections.append(CPListSection(
+            items: speedDialItems(),
+            header: "Speed Dial",
+            sectionIndexTitle: nil
+        ))
+
+        // 3. Quick Picks — top 10 from RecentlyPlayed. Omitted if empty.
+        let recents = RecentlyPlayedManager.shared.songs
+        let quickPicks = Array(recents.prefix(10))
+        if !quickPicks.isEmpty {
+            sections.append(CPListSection(
+                items: makeListItems(from: quickPicks, seed: "Home:QuickPicks"),
+                header: "Quick picks",
+                sectionIndexTitle: nil
+            ))
+        }
+
+        // 4. Mood — static 6 tiles, always shown. Same dispatch as legacy Mood tab.
+        sections.append(CPListSection(
+            items: moodSectionItems(),
+            header: "Mood",
+            sectionIndexTitle: nil
+        ))
+
+        // 5. Trending now — first HomeViewModel section. Omitted while empty.
+        if let trending = homeViewModel.sections.first, !trending.songs.isEmpty {
+            let songs = Array(trending.songs.prefix(10))
+            sections.append(CPListSection(
+                items: makeListItems(from: songs, seed: "Home:Trending"),
+                header: "Trending now",
+                sectionIndexTitle: nil
+            ))
+        }
+
+        // 6. Latest Hindi — also from HomeViewModel. Omitted while empty.
+        let hindi = Array(homeViewModel.latestHindi.prefix(10))
+        if !hindi.isEmpty {
+            sections.append(CPListSection(
+                items: makeListItems(from: hindi, seed: "Home:LatestHindi"),
+                header: "Latest Hindi",
+                sectionIndexTitle: nil
+            ))
+        }
+
+        return sections
+    }
+
+    /// Speed Dial rows — Liked Songs virtual tile (always present) + the
+    /// first 6 user playlists in `PlaylistManager.shared.currentPlaylists`
+    /// order (matches Library tab order).
+    private func speedDialItems() -> [CPListItem] {
+        var items: [CPListItem] = []
+
+        // Row 1 — Liked Songs.
+        let likedCount = LibraryStore.shared.likedSongs.count
+        let likedItem = CPListItem(
+            text: "Liked Songs",
+            detailText: "\(likedCount) \(likedCount == 1 ? "song" : "songs")"
+        )
+        likedItem.setImage(Self.likedTileImage())
+        likedItem.handler = { [weak self] _, completion in
+            self?.openLikedSongs()
+            completion()
+        }
+        items.append(likedItem)
+
+        // Rows 2…7 — first 6 playlists.
+        let playlists = PlaylistManager.shared.currentPlaylists.prefix(6)
+        for playlist in playlists {
+            items.append(playlistListItem(playlist))
+        }
+
+        return items
+    }
+
+    /// Single-row builder shared by Speed Dial + Library tab so the row
+    /// shape stays in lockstep across both surfaces.
+    private func playlistListItem(_ playlist: UserPlaylist) -> CPListItem {
+        let subtitle = Self.playlistSubtitle(playlist)
+        let item = CPListItem(
+            text: "\(playlist.emoji) \(playlist.name)",
+            detailText: subtitle
+        )
+        item.setImage(carPlayPlaylistPlaceholder)
+        if let firstID = playlist.songIDs.first,
+           let cachedSong = RecentlyPlayedManager.shared.songs.first(where: { $0.youtubeID == firstID }) {
+            Self.loadImage(from: cachedSong.thumbnailURL, into: item)
+        }
+        item.handler = { [weak self] _, completion in
+            self?.openPlaylist(playlist)
+            completion()
+        }
+        return item
+    }
+
+    /// Mood section rows — same titles + queries + symbols as the legacy
+    /// `moodTiles` static. Each tap routes to the existing
+    /// `playMoodTile(title:query:)` dispatch, identical to the old grid.
+    private func moodSectionItems() -> [CPListItem] {
+        Self.moodTiles.map { tile in
+            let item = CPListItem(text: tile.title, detailText: nil)
+            item.setImage(Self.moodTileImage(symbolName: tile.symbol))
+            item.handler = { [weak self] _, completion in
+                self?.playMoodTile(title: tile.title, query: tile.query)
+                completion()
+            }
+            return item
+        }
+    }
+
+    /// Pushes a CPListTemplate of the user's liked songs. Empty-state
+    /// row guides them to the heart button on Now Playing.
+    private func openLikedSongs() {
+        guard let controller = interfaceController else { return }
+        let liked = LibraryStore.shared.likedSongs
+        let template: CPListTemplate
+        if liked.isEmpty {
+            template = CPListTemplate(
+                title: "Liked Songs",
+                sections: [CPListSection(items: [
+                    Self.placeholderItem(text: "No liked songs yet — tap the heart on Now Playing to save")
+                ])]
+            )
+        } else {
+            let items = makeListItems(from: liked, seed: "LikedSongs")
+            template = CPListTemplate(
+                title: "Liked Songs",
+                sections: [CPListSection(items: items)]
+            )
+        }
+        template.trailingNavigationBarButtons = [makeSearchButton()]
+        controller.pushTemplate(template, animated: true) { _, error in
+            if let error {
+                coordinatorLogger.error("🚗 openLikedSongs push failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Renders a 120pt pink-tinted heart over the same placeholder canvas
+    /// playlists use, so the Liked tile reads at identical visual weight.
+    private static func likedTileImage() -> UIImage {
+        let size = carPlayArtworkSize
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { ctx in
+            // Dark base (matches playlist placeholder visual weight).
+            UIColor(red: 0.10, green: 0.05, blue: 0.12, alpha: 1).setFill()
+            ctx.cgContext.fill(CGRect(origin: .zero, size: size))
+            let cfg = UIImage.SymbolConfiguration(pointSize: 60, weight: .semibold)
+            if let icon = UIImage(systemName: "heart.fill", withConfiguration: cfg)?
+                .withTintColor(.systemPink, renderingMode: .alwaysOriginal) {
+                let rect = CGRect(
+                    x: (size.width - icon.size.width) / 2,
+                    y: (size.height - icon.size.height) / 2,
+                    width: icon.size.width,
+                    height: icon.size.height
+                )
+                icon.draw(in: rect)
+            }
+        }
+    }
+
     // MARK: - Last Played tab
 
     /// UserDefaults key for the per-song play-count dictionary that
@@ -594,7 +543,7 @@ final class CarPlayCoordinator: NSObject {
                 // Home grid's live-state dots (Continue, Mashup)
                 // depend on recents + lastPlayed freshness — rebuild
                 // the grid so indicators stay accurate.
-                self?.buildHomeGrid()
+                self?.refreshHome()
                 self?.observeLastPlayed()
             }
         }
@@ -1073,27 +1022,7 @@ final class CarPlayCoordinator: NSObject {
     /// clone built from this.
     private func computeLibrarySections() -> [CPListSection] {
         let lists = PlaylistManager.shared.currentPlaylists
-        let items = lists.map { playlist -> CPListItem in
-            let subtitle = Self.playlistSubtitle(playlist)
-            let item = CPListItem(
-                text: "\(playlist.emoji) \(playlist.name)",
-                detailText: subtitle
-            )
-            // Always show artwork. Prefer a thumbnail from the first
-            // song if it's already cached in RecentlyPlayed (no new API
-            // call). Otherwise fall back to the gradient placeholder so
-            // every row has the same visual weight.
-            item.setImage(carPlayPlaylistPlaceholder)
-            if let firstID = playlist.songIDs.first,
-               let cachedSong = RecentlyPlayedManager.shared.songs.first(where: { $0.youtubeID == firstID }) {
-                Self.loadImage(from: cachedSong.thumbnailURL, into: item)
-            }
-            item.handler = { [weak self] _, completion in
-                self?.openPlaylist(playlist)
-                completion()
-            }
-            return item
-        }
+        let items = lists.map { playlistListItem($0) }
         guard !items.isEmpty else { return [] }
         return [CPListSection(items: items)]
     }
