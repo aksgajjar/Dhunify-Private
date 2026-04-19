@@ -221,7 +221,7 @@ final class CarPlayCoordinator: NSObject {
         for (_, task) in playlistSongTasks { task.cancel() }
     }
 
-    // MARK: - Home tab
+    // MARK: - Search button
 
     /// Fresh search-button factory — each template needs its own
     /// CPBarButton instance (CPBarButton isn't safely sharable across
@@ -577,11 +577,11 @@ final class CarPlayCoordinator: NSObject {
         return Array(ranked.prefix(limit))
     }
 
-    // MARK: - Mood tab
+    // MARK: - Mood tiles (shared with Home tab Mood section)
 
     /// Static 6-tile definition. Query, title and SF Symbol picked once
     /// at compile time — no runtime switching, no engine, no calendar
-    /// logic. Drivers get the same tiles every time they open the tab.
+    /// logic. Drivers see the same tiles every time the Home tab renders.
     private static let moodTiles: [(title: String, query: String, symbol: String)] = [
         ("Drive",      "bollywood driving songs",  "car.fill"),
         ("Chill",      "lofi chill hindi",         "cup.and.saucer.fill"),
@@ -633,7 +633,7 @@ final class CarPlayCoordinator: NSObject {
         }
     }
 
-    // MARK: - Explore tab
+    // MARK: - Mashup tab
 
     /// Static 3-query set for Bollywood mashups. No new API — reuses the
     /// shared searchSongsUseCase. Queries picked to balance recency
@@ -646,8 +646,7 @@ final class CarPlayCoordinator: NSObject {
     ]
 
     /// Last loaded Bollywood mashups (already dedup'd + ranked). Drives
-    /// the first section of Explore. Empty until `loadExploreMashups`
-    /// completes.
+    /// the Mashup tab body. Empty until `loadMashups` completes.
     private var loadedMashups: [Song] = []
 
     /// Rebuilds the Mashup tab from `loadedMashups`. Shows a placeholder
