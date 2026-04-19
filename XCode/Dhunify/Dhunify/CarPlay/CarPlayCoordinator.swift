@@ -540,9 +540,9 @@ final class CarPlayCoordinator: NSObject {
                 self?.bumpTopPlayedIfNeeded()
                 self?.refreshLastPlayed()
                 self?.refreshExplore()
-                // Home grid's live-state dots (Continue, Mashup)
-                // depend on recents + lastPlayed freshness — rebuild
-                // the grid so indicators stay accurate.
+                // Home Continue + Quick Picks sections depend on
+                // recents + last-played freshness — refresh so they
+                // stay current.
                 self?.refreshHome()
                 self?.observeLastPlayed()
             }
