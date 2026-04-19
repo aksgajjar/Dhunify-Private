@@ -92,8 +92,8 @@ final class CarPlayCoordinator: NSObject {
 
     /// "Home" — top-level 6-tile grid with shortcut buttons. First tab.
     private let homeTemplate = CPGridTemplate(title: "Home", gridButtons: [])
-    /// "Drive" — Resume row + Recently Played + Top Played.
-    private let driveTemplate = CPListTemplate(title: "Drive", sections: [])
+    /// "Last Played" — Resume row + Recently Played + Top Played.
+    private let lastPlayedTemplate = CPListTemplate(title: "Last Played", sections: [])
     /// "Mashup" — 🔥 Bollywood Mashups list (moved out of Explore).
     private let mashupTemplate = CPListTemplate(title: "Mashup", sections: [])
     /// "Mood" — 6-tile static grid. No dynamic mood logic.
@@ -140,10 +140,10 @@ final class CarPlayCoordinator: NSObject {
         homeTemplate.tabTitle = "Home"
         homeTemplate.tabImage = UIImage(systemName: "house.fill")
 
-        driveTemplate.tabTitle = "Drive"
-        driveTemplate.tabImage = UIImage(systemName: "car.fill")
-        driveTemplate.emptyViewTitleVariants = ["Nothing yet"]
-        driveTemplate.emptyViewSubtitleVariants = ["Play a song to see it here"]
+        lastPlayedTemplate.tabTitle = "Last Played"
+        lastPlayedTemplate.tabImage = UIImage(systemName: "clock.arrow.circlepath")
+        lastPlayedTemplate.emptyViewTitleVariants = ["Nothing yet"]
+        lastPlayedTemplate.emptyViewSubtitleVariants = ["Play a song to see it here"]
 
         mashupTemplate.tabTitle = "Mashup"
         mashupTemplate.tabImage = UIImage(systemName: "waveform")
@@ -169,7 +169,7 @@ final class CarPlayCoordinator: NSObject {
         // NSInvalidArgumentException, so we avoid it entirely.
         rootTemplate = CPTabBarTemplate(templates: [
             homeTemplate,
-            driveTemplate,
+            lastPlayedTemplate,
             mashupTemplate,
             moodTemplate,
             libraryTemplate,
@@ -183,7 +183,7 @@ final class CarPlayCoordinator: NSObject {
             self?.presentSearch()
         }
         homeTemplate.trailingNavigationBarButtons = [searchButton]
-        driveTemplate.trailingNavigationBarButtons = [searchButton]
+        lastPlayedTemplate.trailingNavigationBarButtons = [searchButton]
         mashupTemplate.trailingNavigationBarButtons = [searchButton]
         moodTemplate.trailingNavigationBarButtons = [searchButton]
         exploreTemplate.trailingNavigationBarButtons = [searchButton]
@@ -196,8 +196,8 @@ final class CarPlayCoordinator: NSObject {
         buildMoodGrid()
 
         // Drive — Resume row + Recents + Top Played. Sync from UserDefaults.
-        refreshDrive()
-        observeDrive()
+        refreshLastPlayed()
+        observeLastPlayed()
 
         // Explore — Continue Mashup Session row (when detected).
         refreshExplore()
@@ -489,7 +489,7 @@ final class CarPlayCoordinator: NSObject {
             pushCloneList(title: "Mashup", sections: computeMashupSections(),
                           emptyText: "Loading mashups…", on: controller)
         case .openDrive:
-            pushCloneList(title: "Drive", sections: computeDriveSections(),
+            pushCloneList(title: "Last Played", sections: computeLastPlayedSections(),
                           emptyText: "Play a song to see it here", on: controller)
         case .openMood:
             let clone = CPGridTemplate(title: "Mood", gridButtons: computeMoodButtons())
@@ -567,25 +567,25 @@ final class CarPlayCoordinator: NSObject {
     /// Re-registers `withObservationTracking` so the Drive tab refreshes
     /// whenever a new song is added to RecentlyPlayedManager. Also bumps
     /// the play counter for the newly-prepended song.
-    private func observeDrive() {
+    private func observeLastPlayed() {
         withObservationTracking {
             _ = RecentlyPlayedManager.shared.songs
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 self?.bumpTopPlayedIfNeeded()
-                self?.refreshDrive()
+                self?.refreshLastPlayed()
                 self?.refreshExplore()
                 // Home grid's live-state dots (Continue, Mashup)
                 // depend on recents + lastPlayed freshness — rebuild
                 // the grid so indicators stay accurate.
                 self?.buildHomeGrid()
-                self?.observeDrive()
+                self?.observeLastPlayed()
             }
         }
     }
 
     /// Increment the top-played counter for the current head of Recents
-    /// when it changes. Called from `observeDrive` so playback never
+    /// when it changes. Called from `observeLastPlayed` so playback never
     /// needs to know about this counter.
     private func bumpTopPlayedIfNeeded() {
         guard let head = RecentlyPlayedManager.shared.songs.first else { return }
@@ -597,23 +597,23 @@ final class CarPlayCoordinator: NSObject {
         UserDefaults.standard.set(counts, forKey: Self.topPlayedKey)
     }
 
-    private func refreshDrive() {
-        let sections = computeDriveSections()
+    private func refreshLastPlayed() {
+        let sections = computeLastPlayedSections()
         if sections.isEmpty {
-            driveTemplate.updateSections([
+            lastPlayedTemplate.updateSections([
                 CPListSection(items: [
                     Self.placeholderItem(text: "Play a song to see it here")
                 ])
             ])
         } else {
-            driveTemplate.updateSections(sections)
+            lastPlayedTemplate.updateSections(sections)
         }
     }
 
-    /// Builds the Drive tab sections fresh. Exposed so Home grid's "Drive"
+    /// Builds the Last Played tab sections fresh. Exposed so Home grid's "Drive"
     /// button can push a standalone clone — CarPlay templates can only
     /// live in one place, so shortcuts need their own instance.
-    private func computeDriveSections() -> [CPListSection] {
+    private func computeLastPlayedSections() -> [CPListSection] {
         var sections: [CPListSection] = []
 
         // Section 1 — Resume (only if within 24h of last play).
