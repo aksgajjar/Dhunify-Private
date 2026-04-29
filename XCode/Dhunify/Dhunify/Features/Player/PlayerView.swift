@@ -6,6 +6,8 @@
 //
 
 import SwiftUI
+import UIKit
+import AVKit
 
 struct PlayerView: View {
     @Environment(\.dismiss) private var dismiss
@@ -22,6 +24,7 @@ struct PlayerView: View {
     @State private var showPlaylistSheet = false
     @State private var showQueue = false
     @State private var showSongInfo = false
+    @State private var showShareSheet = false
     private var dominantColor: Color { viewModel.dominantColor }
 
     private var viewModel: PlayerViewModel { container.playerViewModel }
@@ -77,12 +80,18 @@ struct PlayerView: View {
                 artwork
                     .padding(.horizontal, 40)
 
-                Spacer(minLength: 12)
+                // Audio visualizer strip (decorative, pseudo-reactive)
+                AudioVisualizerStrip(isPlaying: viewModel.isPlaying)
+                    .frame(height: 28)
+                    .padding(.horizontal, 40)
+                    .padding(.top, 14)
+
+                Spacer(minLength: 8)
 
                 // Song info
                 songInfo
                     .padding(.horizontal, 32)
-                    .padding(.top, 6)
+                    .padding(.top, 2)
 
                 // Error
                 if let error = viewModel.playbackError {
@@ -193,14 +202,19 @@ struct PlayerView: View {
             .padding(.top, 52)
             .padding(.leading, 20)
         }
-        // Info button — top-right
+        // Top-right: AirPlay (mirror) + Info
         .overlay(alignment: .topTrailing) {
-            Button { showSongInfo = true } label: {
-                Image(systemName: "info.circle")
-                    .font(.system(size: 22))
-                    .foregroundStyle(.white.opacity(0.7))
+            HStack(spacing: 14) {
+                AirPlayRoutePicker()
+                    .frame(width: 26, height: 26)
+
+                Button { showSongInfo = true } label: {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                .buttonStyle(ScalePressButtonStyle())
             }
-            .buttonStyle(ScalePressButtonStyle())
             .padding(.top, 58)
             .padding(.trailing, 20)
         }
@@ -212,6 +226,13 @@ struct PlayerView: View {
                     .task {
                         // Trigger loading
                     }
+            }
+        }
+        .sheet(isPresented: $showShareSheet) {
+            if let song = viewModel.currentSong {
+                let url = "https://www.youtube.com/watch?v=\(song.youtubeID)"
+                let text = "\(song.title) — \(song.artist)\n\(url)"
+                ShareSheet(items: [text])
             }
         }
         .offset(y: max(0, dragOffset))
@@ -366,22 +387,26 @@ struct PlayerView: View {
                 .buttonStyle(ScalePressButtonStyle())
             }
 
-            // Heart / library button
-            Button {
-                guard let song = viewModel.currentSong else { return }
-                HapticManager.soft()
-                isLiked.toggle()
-                if isLiked {
-                    Task {
-                        try? await container.songStore.save(song: song)
-                        showToast("Added to Library")
-                    }
-                } else {
-                    Task {
-                        try? await container.songStore.remove(song: song)
-                        showToast("Removed from Library")
-                    }
+            // Share — native iOS share sheet (WhatsApp, Messages, etc.)
+            if viewModel.currentSong != nil {
+                Button {
+                    HapticManager.soft()
+                    showShareSheet = true
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.white)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(ScalePressButtonStyle())
+            }
+
+            // Heart / library button — opens Add to Playlist sheet.
+            Button {
+                guard viewModel.currentSong != nil else { return }
+                HapticManager.soft()
+                showPlaylistSheet = true
             } label: {
                 Image(systemName: isLiked ? "heart.fill" : "heart")
                     .font(.system(size: 22, weight: .semibold))
@@ -640,4 +665,112 @@ private struct ProgressSlider: View {
 
 private extension BinaryFloatingPoint {
     var clamped01: Self { Swift.max(0, Swift.min(self, 1)) }
+}
+
+// MARK: - Share sheet
+
+private struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+// MARK: - AirPlay route picker
+
+private struct AirPlayRoutePicker: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let view = AVRoutePickerView()
+        view.prioritizesVideoDevices = false
+        view.activeTintColor = .systemOrange
+        view.tintColor = UIColor.white.withAlphaComponent(0.85)
+        view.backgroundColor = .clear
+        return view
+    }
+
+    func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
+}
+
+// MARK: - Audio Visualizer Strip
+//
+// Decorative, pseudo-reactive visualizer. Bar heights come from a sum
+// of sine waves seeded by a per-bar phase offset, so the strip looks
+// alive without tapping the AVPlayer audio pipeline (zero CPU cost on
+// the audio path, ~one TimelineView redraw per frame). When playback
+// pauses, TimelineView pauses and bars settle to their idle baseline.
+
+private struct AudioVisualizerStrip: View {
+    var isPlaying: Bool
+
+    private let barCount: Int = 44
+    private let barSpacing: CGFloat = 2
+    private let cornerRadius: CGFloat = 1.5
+    private let minHeightFraction: CGFloat = 0.18
+
+    // Stable per-bar phase offsets so each bar moves slightly out of
+    // sync with its neighbours — gives the natural "wave" feel without
+    // randomness on every redraw (which would jitter).
+    private static let phaseOffsets: [Double] = {
+        var result: [Double] = []
+        result.reserveCapacity(44)
+        for i in 0..<44 {
+            let base: Double = Double(i) * 0.37
+            let wobble: Double = sin(Double(i) * 1.13) * 0.9
+            result.append(base + wobble)
+        }
+        return result
+    }()
+
+    var body: some View {
+        GeometryReader { geo in
+            let totalSpacing = barSpacing * CGFloat(barCount - 1)
+            let barWidth = max(1, (geo.size.width - totalSpacing) / CGFloat(barCount))
+            let maxHeight = geo.size.height
+
+            TimelineView(.animation(paused: !isPlaying)) { timeline in
+                let t = timeline.date.timeIntervalSinceReferenceDate
+
+                HStack(alignment: .center, spacing: barSpacing) {
+                    ForEach(0..<barCount, id: \.self) { index in
+                        let h = barHeight(for: index, time: t, maxHeight: maxHeight)
+                        RoundedRectangle(cornerRadius: cornerRadius)
+                            .fill(rainbowGradient)
+                            .frame(width: barWidth, height: h)
+                    }
+                }
+                .frame(width: geo.size.width, height: maxHeight, alignment: .center)
+            }
+            .shadow(color: Color.appAccent.opacity(0.35), radius: 6, x: 0, y: 0)
+            .animation(.easeOut(duration: 0.35), value: isPlaying)
+        }
+    }
+
+    private var rainbowGradient: LinearGradient {
+        let red = Color(hue: 0.00, saturation: 0.85, brightness: 1.0)
+        let orange = Color(hue: 0.08, saturation: 0.90, brightness: 1.0)
+        let yellow = Color(hue: 0.15, saturation: 0.85, brightness: 1.0)
+        let green = Color(hue: 0.33, saturation: 0.80, brightness: 0.95)
+        let cyan = Color(hue: 0.50, saturation: 0.85, brightness: 1.0)
+        let blue = Color(hue: 0.62, saturation: 0.85, brightness: 1.0)
+        let magenta = Color(hue: 0.80, saturation: 0.85, brightness: 1.0)
+        let stops: [Color] = [red, orange, yellow, green, cyan, blue, magenta]
+        return LinearGradient(colors: stops, startPoint: .leading, endPoint: .trailing)
+    }
+
+    private func barHeight(for index: Int, time: Double, maxHeight: CGFloat) -> CGFloat {
+        guard isPlaying else {
+            return maxHeight * minHeightFraction
+        }
+        let phase = Self.phaseOffsets[index % Self.phaseOffsets.count]
+        // Sum of two sines at different rates → fluid, non-periodic feel.
+        let s1 = sin(time * 3.1 + phase)
+        let s2 = sin(time * 5.7 + phase * 1.7)
+        let envelope = (s1 * 0.6 + s2 * 0.4)            // -1..+1
+        let normalized = (envelope + 1.0) * 0.5         // 0..1
+        let scaled = minHeightFraction + (1 - minHeightFraction) * CGFloat(normalized)
+        return maxHeight * scaled
+    }
 }

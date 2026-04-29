@@ -6,6 +6,9 @@
 //
 
 import Foundation
+import os
+
+private let playlistLog = Logger(subsystem: "com.diphoria.Dhunify", category: "Playlist")
 
 struct UserPlaylist: Identifiable, Codable, Hashable {
     let id: UUID
@@ -55,6 +58,7 @@ final class PlaylistManager {
         let playlist = UserPlaylist(name: name, emoji: emoji, profileID: pid)
         playlists.append(playlist)
         save()
+        playlistLog.info("Created playlist '\(name, privacy: .public)' pid=\(pid, privacy: .public) total=\(self.currentPlaylists.count)")
         return playlist
     }
 
@@ -63,7 +67,17 @@ final class PlaylistManager {
         if !playlists[idx].songIDs.contains(songID) {
             playlists[idx].songIDs.append(songID)
             save()
+            let p = playlists[idx]
+            playlistLog.info("Added to playlist '\(p.name, privacy: .public)' count=\(p.songIDs.count)")
         }
+    }
+
+    func renamePlaylist(_ id: UUID, to newName: String) {
+        guard let idx = playlists.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        playlists[idx].name = trimmed
+        save()
     }
 
     func removeSong(_ songID: String, from playlistID: UUID) {

@@ -31,7 +31,7 @@ struct HomeView: View {
         }
         .task {
             if viewModel == nil {
-                let vm = HomeViewModel(searchUseCase: container.searchSongsUseCase)
+                let vm = container.homeViewModel
                 viewModel = vm
                 await vm.loadAll()
             }
@@ -179,24 +179,45 @@ private struct HomeContent: View {
                 // Aaj Ka Mix — AI playlist generator (hero section)
                 aajKaMixSection
 
-                // Latest Hindi (multi-source waterfall)
-                if !viewModel.latestHindi.isEmpty || viewModel.latestHindiLoading {
-                    moodLikeSection(
-                        label: "Latest Hindi",
-                        subtitle: "Fresh tracks from all sources",
-                        isLoading: viewModel.latestHindiLoading,
-                        songs: viewModel.latestHindi
-                    )
-                }
-
-                // Latest Gujarati (multi-source waterfall)
-                if !viewModel.latestGujarati.isEmpty || viewModel.latestGujaratiLoading {
-                    moodLikeSection(
-                        label: "Latest Gujarati",
-                        subtitle: "Nava Gujarati gaano",
-                        isLoading: viewModel.latestGujaratiLoading,
-                        songs: viewModel.latestGujarati
-                    )
+                // Latest Hindi + Gujarati Hits.
+                // Default order is Hindi first; if any Gujarati track
+                // appears in the last 10 plays the order flips so the
+                // user lands on Gujarati Hits without an extra scroll.
+                let gujaratiPreferred = RecentlyPlayedManager.shared.recentlyHasGujarati()
+                if gujaratiPreferred {
+                    if !viewModel.latestGujarati.isEmpty || viewModel.latestGujaratiLoading {
+                        moodLikeSection(
+                            label: "Gujarati Hits",
+                            subtitle: "Nava Gujarati gaano",
+                            isLoading: viewModel.latestGujaratiLoading,
+                            songs: viewModel.latestGujarati
+                        )
+                    }
+                    if !viewModel.latestHindi.isEmpty || viewModel.latestHindiLoading {
+                        moodLikeSection(
+                            label: "Latest Hindi",
+                            subtitle: "Fresh tracks from all sources",
+                            isLoading: viewModel.latestHindiLoading,
+                            songs: viewModel.latestHindi
+                        )
+                    }
+                } else {
+                    if !viewModel.latestHindi.isEmpty || viewModel.latestHindiLoading {
+                        moodLikeSection(
+                            label: "Latest Hindi",
+                            subtitle: "Fresh tracks from all sources",
+                            isLoading: viewModel.latestHindiLoading,
+                            songs: viewModel.latestHindi
+                        )
+                    }
+                    if !viewModel.latestGujarati.isEmpty || viewModel.latestGujaratiLoading {
+                        moodLikeSection(
+                            label: "Gujarati Hits",
+                            subtitle: "Nava Gujarati gaano",
+                            isLoading: viewModel.latestGujaratiLoading,
+                            songs: viewModel.latestGujarati
+                        )
+                    }
                 }
 
                 // Mood detection — time-of-day suggestion
@@ -221,7 +242,7 @@ private struct HomeContent: View {
                 // Song sections
                 ForEach(viewModel.sections) { section in
                     if !section.songs.isEmpty {
-                        compactSection(title: section.title, icon: section.icon, songs: section.songs)
+                        compactSection(title: section.title, icon: section.icon, query: section.query, songs: section.songs)
                             .transition(.opacity)
                     } else if section.isLoading {
                         skeletonSection(title: section.title, icon: section.icon)
@@ -561,6 +582,13 @@ private struct HomeContent: View {
                                         .foregroundColor(.appSecondary)
                                         .lineLimit(1)
                                         .frame(width: 130, alignment: .leading)
+                                    if song.isYouTubeSource, let meta = songMetaText(song, leadingBullet: false) {
+                                        meta
+                                            .font(.system(size: 10))
+                                            .lineLimit(1)
+                                            .truncationMode(.tail)
+                                            .frame(width: 130, alignment: .leading)
+                                    }
                                 }
                             }
                             .scaleButton(0.97)
@@ -709,6 +737,13 @@ private struct HomeContent: View {
                                         .foregroundColor(.appSecondary)
                                         .lineLimit(1)
                                         .frame(width: 130, alignment: .leading)
+                                    if song.isYouTubeSource, let meta = songMetaText(song, leadingBullet: false) {
+                                        meta
+                                            .font(.system(size: 10))
+                                            .lineLimit(1)
+                                            .truncationMode(.tail)
+                                            .frame(width: 130, alignment: .leading)
+                                    }
                                 }
                             }
                             .scaleButton(0.97)
@@ -870,8 +905,14 @@ private struct HomeContent: View {
 
     // ── Song section (compact 110pt cards) ────────────────────
 
-    private func compactSection(title: String, icon: String = "", songs: [Song]) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private func compactSection(title: String, icon: String = "", query: String? = nil, songs: [Song]) -> some View {
+        // Use the underlying section query as the refill seed when
+        // available — display titles like "Romantic Hits" yield mixed
+        // language results from YT, while the section's Hindi-leaning
+        // query (e.g. "romantic hindi songs latest") keeps refill on
+        // the user's preferred language.
+        let seed: String = (query?.isEmpty == false) ? query! : title
+        return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 if !icon.isEmpty {
                     Image(systemName: icon).font(.system(size: 12, weight: .semibold)).foregroundStyle(.appAccent)
@@ -885,7 +926,7 @@ private struct HomeContent: View {
 
                 if !songs.isEmpty {
                     Button {
-                        container.playerViewModel.categorySeed = title
+                        container.playerViewModel.categorySeed = seed
                         router.presentPlayer(queue: songs, startIndex: 0)
                     } label: {
                         Image(systemName: "play.fill")
@@ -896,13 +937,13 @@ private struct HomeContent: View {
                     }
                     .contextMenu {
                         Button {
-                            container.playerViewModel.categorySeed = title
+                            container.playerViewModel.categorySeed = seed
                             router.presentPlayer(queue: songs, startIndex: 0)
                         } label: {
                             Label("Play All", systemImage: "play.fill")
                         }
                         Button {
-                            container.playerViewModel.categorySeed = title
+                            container.playerViewModel.categorySeed = seed
                             router.presentPlayer(queue: songs.shuffled(), startIndex: 0)
                         } label: {
                             Label("Shuffle All", systemImage: "shuffle")
@@ -917,7 +958,7 @@ private struct HomeContent: View {
                     ForEach(songs) { song in
                         Button {
                             let idx = songs.firstIndex(of: song) ?? 0
-                            container.playerViewModel.categorySeed = title
+                            container.playerViewModel.categorySeed = seed
                             router.presentPlayer(queue: songs, startIndex: idx)
                         } label: {
                             let isCurrent = container.playerViewModel.currentSong?.youtubeID == song.youtubeID
@@ -941,6 +982,12 @@ private struct HomeContent: View {
                                     .font(.appCaption)
                                     .foregroundStyle(.appSecondary)
                                     .lineLimit(1)
+                                if song.isYouTubeSource, let meta = songMetaText(song, leadingBullet: false) {
+                                    meta
+                                        .font(.system(size: 10))
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
+                                }
                             }
                             .frame(width: 110)
                         }

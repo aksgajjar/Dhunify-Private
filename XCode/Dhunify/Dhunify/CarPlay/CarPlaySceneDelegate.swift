@@ -31,6 +31,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         _ templateApplicationScene: CPTemplateApplicationScene,
         didConnect interfaceController: CPInterfaceController
     ) {
+        carPlayLogger.info("🚗 didConnect fired — CarPlay tap reached scene delegate")
         self.interfaceController = interfaceController
 
         let container = AppContainer.shared
@@ -51,17 +52,25 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
             container: container
         )
         self.coordinator = coordinator
+        carPlayLogger.info("🚗 Coordinator built — setting root template")
         interfaceController.setRootTemplate(
             coordinator.rootTemplate,
             animated: false
-        ) { _, _ in }
+        ) { success, error in
+            if let error {
+                carPlayLogger.error("🚗 setRootTemplate FAILED: \(error.localizedDescription)")
+            } else {
+                carPlayLogger.info("🚗 Root template set success=\(success)")
+            }
+        }
 
         observeQueueNearEnd()
         Task { [weak self] in
-            await self?.startOrResumePlayback()
-            // Push Now Playing on top of the tab bar once playback
-            // actually starts so the driver lands on the scrubber UI,
-            // not a browse list. They can pop back to browse anytime.
+            await self?.continueIfAlreadyPlaying()
+            // Push Now Playing on top of the browse tree only when the
+            // player is actually playing on connect. If the phone was
+            // idle, keep the driver on the browse list so nothing
+            // starts without explicit user input.
             if container.playerViewModel.isPlaying {
                 self?.coordinator?.pushNowPlaying()
             }
@@ -72,9 +81,12 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         _ templateApplicationScene: CPTemplateApplicationScene,
         didDisconnectInterfaceController interfaceController: CPInterfaceController
     ) {
+        carPlayLogger.info("🚗 didDisconnect — CarPlay scene torn down")
+        // Stability: force-detach any in-flight AVPlayerItem and clear
+        // the load lock so a reconnect can't race a stale load/resolve.
+        AppContainer.shared.playerViewModel.resetForCarPlayDisconnect()
         // Drop our reference — the remote command handlers and
-        // PlayerViewModel stay alive on AppContainer.shared so music
-        // keeps playing after CarPlay disconnects (e.g., engine off).
+        // PlayerViewModel stay alive on AppContainer.shared.
         self.interfaceController = nil
         self.coordinator = nil
         if let observer = queueNearEndObserver {
@@ -83,65 +95,25 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         }
     }
 
-    // MARK: - Auto-start flow
+    // MARK: - Connect flow
 
-    /// Resumes the last queue if it was played within the last 24 hours,
-    /// otherwise seeds a fresh queue of romantic hindi love songs and
-    /// starts playback automatically.
-    private func startOrResumePlayback() async {
+    /// No auto-start on CarPlay connect. If the phone is already
+    /// playing when the car powers up, keep playing (and re-activate
+    /// the audio session so the route survives). Otherwise leave the
+    /// player idle and let the driver tap a song in the browse tree.
+    private func continueIfAlreadyPlaying() async {
         let vm = AppContainer.shared.playerViewModel
 
-        // Already playing from a prior launch — don't interrupt.
-        if vm.isPlaying, vm.currentSong != nil {
-            carPlayLogger.info("🚗 Already playing — skip auto-start")
+        guard vm.isPlaying, vm.currentSong != nil else {
+            carPlayLogger.info("🚗 Idle on connect — waiting for user tap")
             return
         }
 
-        // Re-activate audio session explicitly. On wireless CarPlay
-        // cold-launch the session state can be stale; forcing a
-        // re-activation ensures AVPlayer has an active route before we
-        // ask it to play. Retry up to 3 times — the CarPlay route can
-        // be mid-negotiation on the first tick and throw.
+        carPlayLogger.info("🚗 Already playing — continuing \(vm.currentSong?.title ?? "?")")
+        // Re-activate audio session so wireless CarPlay route takes
+        // over cleanly. Playback itself is already live; we just make
+        // sure the route negotiation doesn't silently drop it.
         await activateAudioSession()
-
-        // Paused song already loaded in memory — just resume. Avoids
-        // re-seeding the queue and losing the current position, which
-        // matters on wireless CarPlay reconnects where the phone was
-        // mid-session before the car radio came online.
-        if !vm.isPlaying, vm.currentSong != nil {
-            carPlayLogger.info("🚗 Resume paused song: \(vm.currentSong?.title ?? "?")")
-            vm.play()
-            startPlaybackWatchdog()
-            return
-        }
-
-        // 1. Prefer the saved queue if it's still fresh (<24h old).
-        if let saved = LastPlayedPersistence.loadQueueIfFresh() {
-            carPlayLogger.info("🚗 Restoring saved queue (\(saved.queue.count) songs, idx=\(saved.index))")
-            vm.setQueue(saved.queue, startIndex: saved.index)
-            vm.play()
-            startPlaybackWatchdog()
-            return
-        }
-
-        // 2. Fall back to the single last-played song. This covers the
-        //    case where only a `Song` was persisted (older app versions,
-        //    or a session that never progressed past one track).
-        if let lastSong = LastPlayedPersistence.load() {
-            carPlayLogger.info("🚗 Restoring single last-played: \(lastSong.title)")
-            vm.setQueue([lastSong], startIndex: 0)
-            vm.play()
-            startPlaybackWatchdog()
-            // Kick the refill so CarPlay doesn't end up on a 1-song
-            // queue with no way forward.
-            NotificationCenter.default.post(name: .dhunifyQueueNearEnd, object: vm)
-            return
-        }
-
-        // 3. Nothing persisted → seed a fresh queue.
-        carPlayLogger.info("🚗 No saved state — seeding fresh queue")
-        await seedRomanticQueue()
-        startPlaybackWatchdog()
     }
 
     /// Tries to activate the shared AVAudioSession in `.playback` mode
@@ -164,85 +136,6 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         carPlayLogger.error("🚗 Audio session activation exhausted retries — continuing anyway")
     }
 
-    /// Polls for up to ~15s and retries `play()` if the player is still
-    /// stalled. Wireless CarPlay cold-connect sometimes lands in a
-    /// state where the item is buffered but rate stays at 0, and a
-    /// second `play()` call is enough to wake it up.
-    private func startPlaybackWatchdog() {
-        Task { @MainActor in
-            let vm = AppContainer.shared.playerViewModel
-            for attempt in 1...5 {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                // If the user started a radio station in the meantime,
-                // stop prodding the song player — it would overlap the
-                // live radio stream.
-                if RadioViewModel.isAnyRadioPlaying {
-                    carPlayLogger.info("🚗 Watchdog: radio owns audio, backing off")
-                    return
-                }
-                guard vm.currentSong != nil else { return }
-                if vm.isPlaying {
-                    carPlayLogger.info("🚗 Playback confirmed (attempt \(attempt))")
-                    return
-                }
-                carPlayLogger.warning("🚗 Still silent after \(attempt * 3)s — retry play()")
-                vm.play()
-            }
-            carPlayLogger.error("🚗 Playback watchdog gave up")
-        }
-    }
-
-    private func seedRomanticQueue() async {
-        let useCase = AppContainer.shared.searchSongsUseCase
-        // Retry up to 5 times. Wireless CarPlay often takes several
-        // seconds before the phone's network stack is actually usable;
-        // a single attempt on cold-launch frequently lost the race.
-        for attempt in 1...5 {
-            do {
-                let songs = try await useCase.execute(query: "romantic hindi love songs")
-                guard !songs.isEmpty else {
-                    carPlayLogger.info("🚗 Seed attempt \(attempt): empty result")
-                    try? await Task.sleep(nanoseconds: 3_000_000_000)
-                    continue
-                }
-                let shuffled = songs.shuffled()
-                AppContainer.shared.playerViewModel.setQueue(
-                    shuffled,
-                    startIndex: 0,
-                    categorySeed: "romantic hindi love songs"
-                )
-                AppContainer.shared.playerViewModel.play()
-                carPlayLogger.info("🚗 Seeded queue (\(shuffled.count) songs) on attempt \(attempt)")
-                return
-            } catch {
-                carPlayLogger.error("🚗 Seed attempt \(attempt) failed: \(error.localizedDescription)")
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-            }
-        }
-        carPlayLogger.error("🚗 Seed exhausted retries — trying offline library fallback")
-        await seedFromOfflineLibrary()
-    }
-
-    /// Last-resort fallback: if every network seed attempt failed (car
-    /// has no data connection yet), use the user's downloaded library
-    /// so the car at least plays *something* on connect.
-    private func seedFromOfflineLibrary() async {
-        let store = AppContainer.shared.songStore
-        guard let library = try? await store.fetchLibrary(),
-              !library.isEmpty else {
-            carPlayLogger.error("🚗 Offline library empty — nothing to play")
-            return
-        }
-        let shuffled = library.shuffled()
-        AppContainer.shared.playerViewModel.setQueue(
-            shuffled,
-            startIndex: 0,
-            categorySeed: "offline library"
-        )
-        AppContainer.shared.playerViewModel.play()
-        carPlayLogger.info("🚗 Seeded from offline library (\(shuffled.count) songs)")
-    }
-
     // MARK: - Continuous play
 
     private func observeQueueNearEnd() {
@@ -263,18 +156,26 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         defer { isRefillingQueue = false }
 
         let vm = AppContainer.shared.playerViewModel
-        // Prefer the category the user started from (e.g. "Romantic
-        // Hits"), falling back to the current song's artist so refill
-        // stays in the same musical neighborhood. Generic trending
-        // query is the last-resort fallback.
-        let query: String
+        // Prefer the category the user started from (e.g. a Hindi
+        // section's underlying query), falling back to the current
+        // song's artist so refill stays in the same musical
+        // neighborhood. All refill queries are forced to include the
+        // word "hindi" — the user listens exclusively to Hindi songs
+        // and YT search on a non-language-tagged seed routinely returns
+        // mixed-language results.
+        let rawQuery: String
         if let seed = vm.categorySeed, !seed.isEmpty {
-            query = seed
+            rawQuery = seed
         } else if let artist = vm.currentSong?.artist, !artist.isEmpty {
-            query = "\(artist) songs"
+            rawQuery = "\(artist) hindi songs"
         } else {
-            query = "hindi hits 2025"
+            rawQuery = "latest hindi songs"
         }
+        // Ensure "hindi" is present somewhere in the query — appending
+        // it is a no-op when the seed already mentions the language.
+        let query: String = rawQuery.lowercased().contains("hindi")
+            ? rawQuery
+            : "\(rawQuery) hindi"
 
         let useCase = AppContainer.shared.searchSongsUseCase
         do {

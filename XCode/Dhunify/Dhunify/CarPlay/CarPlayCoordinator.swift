@@ -114,6 +114,13 @@ final class CarPlayCoordinator: NSObject {
     private var homeLoadTask: Task<Void, Never>?
     /// One in-flight fetch per playlist id so rapid taps don't fan out.
     private var playlistSongTasks: [UUID: Task<Void, Never>] = [:]
+    /// CarPlay-local cache of YouTube view counts. Backfills `viewCount`
+    /// for Songs that came from persisted stores (Recents, Library,
+    /// Downloads, Playlists) so every CarPlay list can sort by views.
+    private var enrichedViewCounts: [String: Int64] = [:]
+    /// Bare videoIds currently being fetched — avoids re-issuing the
+    /// same /player call while a request is mid-flight.
+    private var inFlightEnrichment: Set<String> = []
     /// UserDefaults key for the most-recent search queries (strings).
     private static let recentSearchesKey = "dhunify.carplay.recentSearches"
     /// Max recent queries kept on disk.
@@ -243,6 +250,7 @@ final class CarPlayCoordinator: NSObject {
             _ = LibraryStore.shared.likedSongs
             _ = homeViewModel.sections
             _ = homeViewModel.latestHindi
+            _ = homeViewModel.latestGujarati
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 self?.refreshHome()
@@ -321,14 +329,31 @@ final class CarPlayCoordinator: NSObject {
             ))
         }
 
-        // 6. Latest Hindi — also from HomeViewModel. Omitted while empty.
+        // 6 + 7. Latest Hindi and Gujarati Hits. Default order is Hindi
+        // first; if the user has Gujarati tracks in the last 10 plays
+        // we hoist Gujarati Hits above so the active language lands at
+        // the top of the CarPlay home list. Mirrors HomeView ordering.
         let hindi = Array(homeViewModel.latestHindi.prefix(10))
-        if !hindi.isEmpty {
-            sections.append(CPListSection(
-                items: makeListItems(from: hindi, seed: "Home:LatestHindi"),
-                header: "Latest Hindi",
-                sectionIndexTitle: nil
-            ))
+        let gujarati = Array(homeViewModel.latestGujarati.prefix(10))
+        let gujaratiPreferred = RecentlyPlayedManager.shared.recentlyHasGujarati()
+
+        let hindiSection: CPListSection? = hindi.isEmpty ? nil : CPListSection(
+            items: makeListItems(from: hindi, seed: "Home:LatestHindi"),
+            header: "Latest Hindi",
+            sectionIndexTitle: nil
+        )
+        let gujaratiSection: CPListSection? = gujarati.isEmpty ? nil : CPListSection(
+            items: makeListItems(from: gujarati, seed: "Home:GujaratiHits"),
+            header: "Gujarati Hits",
+            sectionIndexTitle: nil
+        )
+
+        if gujaratiPreferred {
+            if let s = gujaratiSection { sections.append(s) }
+            if let s = hindiSection { sections.append(s) }
+        } else {
+            if let s = hindiSection { sections.append(s) }
+            if let s = gujaratiSection { sections.append(s) }
         }
 
         return sections
@@ -910,13 +935,24 @@ final class CarPlayCoordinator: NSObject {
     /// deduped/capped array as the queue so next/prev steps through
     /// exactly what the driver sees.
     private func makeListItems(from songs: [Song], seed: String) -> [CPListItem] {
+        // Fill in any cached view counts we've already fetched, then sort
+        // by view count desc. Songs without a known view count keep their
+        // original relative order at the end. Kicks an async enrichment
+        // pass for any YT-source songs still missing viewCount; on
+        // completion we refresh all surfaces so the list re-sorts.
+        let enriched = applyEnrichmentToSongs(songs)
+        let sorted = sortByViewsStable(enriched)
+
         var seen = Set<String>()
-        let deduped = songs.filter { song in
+        let deduped = sorted.filter { song in
             guard !seen.contains(song.youtubeID) else { return false }
             seen.insert(song.youtubeID)
             return true
         }
         let capped = Array(deduped.prefix(20))
+
+        kickEnrichment(for: songs)
+
         return capped.enumerated().map { index, song in
             let cleanedTitle = Self.cleanTitle(song.title)
             let subtitle = Self.rowSubtitle(song)
@@ -927,6 +963,65 @@ final class CarPlayCoordinator: NSObject {
                 completion()
             }
             return item
+        }
+    }
+
+    /// Returns a copy of `songs` with `viewCount` filled in from the
+    /// CarPlay-local cache for any YT-source song that lacked it.
+    private func applyEnrichmentToSongs(_ songs: [Song]) -> [Song] {
+        guard !enrichedViewCounts.isEmpty else { return songs }
+        return songs.map { s in
+            guard s.isYouTubeSource, s.viewCount == nil else { return s }
+            let vid = s.youtubeVideoId
+            guard !vid.isEmpty, let v = enrichedViewCounts[vid] else { return s }
+            return s.withViewCount(v)
+        }
+    }
+
+    /// Stable sort by `viewCount` desc — songs without a known view
+    /// count fall to the end while preserving their input order. Swift's
+    /// `sorted(by:)` is not guaranteed stable, hence the index tiebreak.
+    private func sortByViewsStable(_ songs: [Song]) -> [Song] {
+        songs.enumerated().sorted { lhs, rhs in
+            let lv = lhs.element.viewCount ?? 0
+            let rv = rhs.element.viewCount ?? 0
+            if lv != rv { return lv > rv }
+            return lhs.offset < rhs.offset
+        }.map { $0.element }
+    }
+
+    /// Fires an InnerTube /player fetch for any YT-source songs in
+    /// `songs` whose viewCount is still unknown. Caps at the first 20
+    /// missing ids so a single big list doesn't fan out hundreds of
+    /// calls. On completion, refreshes every CarPlay list so the new
+    /// counts surface and rows re-sort.
+    private func kickEnrichment(for songs: [Song]) {
+        let needed = songs
+            .filter { song in
+                guard song.isYouTubeSource, song.viewCount == nil else { return false }
+                let vid = song.youtubeVideoId
+                guard !vid.isEmpty else { return false }
+                return enrichedViewCounts[vid] == nil && !inFlightEnrichment.contains(vid)
+            }
+            .prefix(20)
+            .map { $0.youtubeVideoId }
+        guard !needed.isEmpty else { return }
+        inFlightEnrichment.formUnion(needed)
+
+        Task { [weak self] in
+            let result = await YouTubeViewCountEnricher.shared.fetchViewCounts(videoIds: needed)
+            await MainActor.run {
+                guard let self else { return }
+                for id in needed { self.inFlightEnrichment.remove(id) }
+                guard !result.isEmpty else { return }
+                for (id, v) in result { self.enrichedViewCounts[id] = v }
+                // Refresh every surface so cached counts propagate. Each
+                // refresh re-runs `makeListItems` which re-applies sort.
+                self.refreshHome()
+                self.refreshLastPlayed()
+                self.refreshPlaylists()
+                self.refreshDownloads()
+            }
         }
     }
 

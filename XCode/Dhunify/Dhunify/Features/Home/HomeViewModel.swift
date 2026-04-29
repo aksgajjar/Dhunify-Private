@@ -209,7 +209,15 @@ final class HomeViewModel {
     func loadAll() async {
         // Skip if data is fresh (loaded <12h ago) and sections have songs.
         let hasSongs = sections.contains { !$0.songs.isEmpty }
-        if hasSongs && !needsRefresh { return }
+        if hasSongs && !needsRefresh {
+            // Cached data is used (warm path) — kick view-count enrichment
+            // in the background so YT items still surface view counts on
+            // re-open within the 12h refresh window. Non-blocking.
+            Task { [weak self] in
+                await self?.enrichHomeFeedsViews()
+            }
+            return
+        }
 
         // Reset sections to loading state for refresh.
         for i in sections.indices {
@@ -282,6 +290,69 @@ final class HomeViewModel {
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.refreshKey)
         writeDiskCache()
         logger.info("🏠 All sections loaded — next refresh in 12h")
+
+        // UI is visible (isLoading already false). Enrich view counts for
+        // sections whose items still have `viewCount == nil` (backend-fed
+        // feeds like Trending / Latest). Runs after UI paints; enrichment
+        // failure is silent — row falls back to duration-only display.
+        await enrichHomeFeedsViews()
+    }
+
+    // MARK: - View count enrichment
+    //
+    // Spec: enrich only top 8–10 visible items per section, only YT items
+    // missing viewCount, never issue a second call for the same videoId
+    // within 6h (handled by the enricher's in-memory cache). Enrichment
+    // failure is silent — row falls back to duration-only display.
+
+    private static let enrichmentSliceSize = 10
+
+    /// Fetch missing view counts for the currently-populated Home feeds
+    /// and update the @Observable arrays in place so SwiftUI re-renders
+    /// with the accent-colored view counts.
+    private func enrichHomeFeedsViews() async {
+        // Trending = sections[0]. Other sections from searchUseCase already
+        // carry viewCount for videoRenderer items, but we run them through
+        // enrichment anyway — cache hits make this cheap and music-shelf
+        // items will still get filled where possible.
+        for i in sections.indices {
+            let before = sections[i].songs
+            let after = await Self.enrich(songs: before)
+            if after.count == before.count, !zip(before, after).allSatisfy({ $0.viewCount == $1.viewCount }) {
+                sections[i].songs = after
+            }
+        }
+        forYouSongs = await Self.enrich(songs: forYouSongs)
+        occasionSongs = await Self.enrich(songs: occasionSongs)
+        moodSongs = await Self.enrich(songs: moodSongs)
+        latestHindi = await Self.enrich(songs: latestHindi)
+        latestGujarati = await Self.enrich(songs: latestGujarati)
+    }
+
+    /// Enrich the first N YouTube items that lack `viewCount`. Non-YT items
+    /// and already-enriched items are left untouched. Caller is expected to
+    /// reassign the returned array so SwiftUI observes the change.
+    private static func enrich(songs: [Song]) async -> [Song] {
+        guard !songs.isEmpty else { return songs }
+
+        let slice = songs.prefix(enrichmentSliceSize)
+        let missing = slice.filter { $0.isYouTubeSource && $0.viewCount == nil }
+        guard !missing.isEmpty else { return songs }
+
+        let videoIds = missing.map { $0.youtubeVideoId }.filter { !$0.isEmpty }
+        guard !videoIds.isEmpty else { return songs }
+
+        let views = await YouTubeViewCountEnricher.shared.fetchViewCounts(videoIds: videoIds)
+        guard !views.isEmpty else { return songs }
+
+        return songs.map { s in
+            guard s.isYouTubeSource, s.viewCount == nil else { return s }
+            let vid = s.youtubeVideoId
+            if !vid.isEmpty, let v = views[vid] {
+                return s.withViewCount(v)
+            }
+            return s
+        }
     }
 
     /// Force refresh — called by pull-to-refresh or manually.
@@ -395,8 +466,15 @@ final class HomeViewModel {
         latestHindiLoading = true
         latestGujaratiLoading = true
 
-        async let hindi = fetchLatestSongs(lang: "hindi")
-        async let gujarati = fetchLatestSongs(lang: "gujarati")
+        // Section queries are explicit user-spec — keep verbatim. They
+        // route through the standard search use case so refill-by-seed
+        // (CarPlaySceneDelegate.refillQueue) gets the same result set
+        // when extending the queue mid-drive.
+        let hindiQuery = "latest hindi songs 2026 new release hindi songs"
+        let gujaratiQuery = "latest gujarati songs 2026 new release gujarati songs"
+
+        async let hindi: [Song] = (try? searchUseCase.execute(query: hindiQuery)) ?? []
+        async let gujarati: [Song] = (try? searchUseCase.execute(query: gujaratiQuery)) ?? []
 
         latestHindi = await hindi
         latestGujarati = await gujarati

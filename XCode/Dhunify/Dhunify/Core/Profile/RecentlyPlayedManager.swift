@@ -37,6 +37,34 @@ final class RecentlyPlayedManager {
         load()
     }
 
+    /// Lightweight Gujarati-presence check across the last 10 plays.
+    /// Drives the Home / CarPlay section ordering: when Gujarati shows
+    /// up in the recent window, the "Gujarati Hits" section is hoisted
+    /// above "Latest Hindi". Pure keyword match — no script detection,
+    /// no ML, ~zero CPU.
+    func recentlyHasGujarati() -> Bool {
+        let window = songs.prefix(10)
+        guard !window.isEmpty else { return false }
+        let keywords: [String] = [
+            "gujarati", "garba", "navratri", "dandiya", "raas",
+            "falguni pathak", "kinjal", "geeta rabari", "jignesh kaviraj",
+            "kirtidan", "aditya gadhvi"
+        ]
+        for song in window {
+            let haystack = "\(song.title) \(song.artist)".lowercased()
+            // Latin keywords.
+            for kw in keywords where haystack.contains(kw) {
+                return true
+            }
+            // Gujarati Unicode block (U+0A80–U+0AFF). One scalar in
+            // range = Gujarati script in title or artist.
+            for scalar in haystack.unicodeScalars {
+                if (0x0A80...0x0AFF).contains(scalar.value) { return true }
+            }
+        }
+        return false
+    }
+
     private func save() {
         guard let data = try? JSONEncoder().encode(songs) else { return }
         UserDefaults.standard.set(data, forKey: key)

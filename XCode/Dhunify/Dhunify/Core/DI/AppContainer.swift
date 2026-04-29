@@ -73,6 +73,15 @@ final class AppContainer {
     @ObservationIgnored
     lazy var downloadManager: DownloadManager = DownloadManager(modelContainer: modelContainer)
 
+    /// Shared Home view-model. HomeView and CarPlayCoordinator read from
+    /// the same `sections` array so CarPlay's Trending / Popular tabs
+    /// mirror the iPhone Home screen using the same disk cache + load
+    /// cycle — no duplicate API calls.
+    @ObservationIgnored
+    lazy var homeViewModel: HomeViewModel = HomeViewModel(
+        searchUseCase: searchSongsUseCase
+    )
+
     private init() {
         // SwiftData's ModelContainer expects Library/Application Support
         // to exist. On fresh install the directory is missing, which

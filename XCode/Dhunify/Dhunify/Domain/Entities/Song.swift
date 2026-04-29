@@ -17,6 +17,8 @@ struct Song: Identifiable, Codable, Hashable {
     let isDownloaded: Bool
     let localFileURL: String?
     let addedAt: Date
+    /// YouTube videoRenderer view count. `nil` for music-shelf and JioSaavn items.
+    let viewCount: Int64?
 
     init(
         id: UUID = UUID(),
@@ -27,7 +29,8 @@ struct Song: Identifiable, Codable, Hashable {
         duration: TimeInterval,
         isDownloaded: Bool = false,
         localFileURL: String? = nil,
-        addedAt: Date = Date()
+        addedAt: Date = Date(),
+        viewCount: Int64? = nil
     ) {
         self.id = id
         self.title = title
@@ -38,6 +41,7 @@ struct Song: Identifiable, Codable, Hashable {
         self.isDownloaded = isDownloaded
         self.localFileURL = localFileURL
         self.addedAt = addedAt
+        self.viewCount = viewCount
     }
 
     // MARK: - Source
@@ -57,5 +61,32 @@ struct Song: Identifiable, Codable, Hashable {
     var lyricsId: String {
         guard youtubeID.hasPrefix("jio_") else { return "" }
         return String(youtubeID.dropFirst(4))
+    }
+
+    // MARK: - View count enrichment
+
+    /// Bare videoId (without `yt_` prefix) for YouTube items. Empty otherwise.
+    var youtubeVideoId: String {
+        guard youtubeID.hasPrefix("yt_") else { return "" }
+        return String(youtubeID.dropFirst(3))
+    }
+
+    /// Returns a copy of this Song with `viewCount` set, preserving `id` and
+    /// all other fields. Used by Home feed enrichment to fill in view counts
+    /// fetched from the InnerTube /player endpoint without breaking
+    /// SwiftUI `ForEach` identity.
+    func withViewCount(_ v: Int64) -> Song {
+        Song(
+            id: id,
+            title: title,
+            artist: artist,
+            thumbnailURL: thumbnailURL,
+            youtubeID: youtubeID,
+            duration: duration,
+            isDownloaded: isDownloaded,
+            localFileURL: localFileURL,
+            addedAt: addedAt,
+            viewCount: v
+        )
     }
 }

@@ -11,6 +11,9 @@ import SwiftData
 import UIKit
 import AVFoundation
 internal import CarPlay
+import os
+
+private let appLifecycleLogger = Logger(subsystem: "com.diphoria.Dhunify", category: "AppLifecycle")
 
 /// Pure SwiftUI `@main` means `WindowGroup.task` only fires when the
 /// user-facing scene activates. For CarPlay cold-launch (app killed,
@@ -71,7 +74,9 @@ final class DhunifyAppDelegate: NSObject, UIApplicationDelegate {
         configurationForConnecting connectingSceneSession: UISceneSession,
         options: UIScene.ConnectionOptions
     ) -> UISceneConfiguration {
+        appLifecycleLogger.info("🎬 configurationForConnecting — role=\(connectingSceneSession.role.rawValue, privacy: .public)")
         if connectingSceneSession.role == .carTemplateApplication {
+            appLifecycleLogger.info("🚗 Returning CarPlay scene configuration (delegate=CarPlaySceneDelegate)")
             let config = UISceneConfiguration(
                 name: "CarPlay Configuration",
                 sessionRole: connectingSceneSession.role

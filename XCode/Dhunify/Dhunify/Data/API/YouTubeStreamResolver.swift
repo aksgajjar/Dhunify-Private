@@ -78,10 +78,22 @@ final class YouTubeStreamResolver {
     private let endpoint = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
     private let innertubeKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 
-    // Short-track chain: IOS (primary) + ANDROID_VR (last-resort).
-    // IOS returns URLs signed for general distribution (no `ip=`
-    // binding), ANDROID_VR is the fallback whose URLs often carry the
-    // server-IP `ip=` param. Sticky reorder applies to this chain.
+    // Active client chain. Probes against InnerTube (2026-04-27)
+    // verified that of the previously-tried clients (IOS, IOS_MUSIC,
+    // TVHTML5_SIMPLY_EMBEDDED_PLAYER, ANDROID_VR, ANDROID, WEB, MWEB,
+    // TVHTML5, ANDROID_MUSIC, WEB_EMBEDDED_PLAYER) **only IOS and
+    // ANDROID_VR still return playable streams without a PoToken**.
+    // IOS_MUSIC returns LOGIN_REQUIRED, TVHTML5_SIMPLY_EMBEDDED_PLAYER
+    // returns ERROR — keeping them in the chain wasted ~400-800 ms per
+    // resolve before reaching IOS. IOS already returns
+    // `hlsManifestUrl` for music videos (verified on 502s mashup), so
+    // long-track HLS still works via this chain.
+    //
+    // IOS — IP-neutral URLs (general-distribution signed), HLS for
+    // music content, no signature cipher.
+    // ANDROID_VR — last-resort. URLs typically carry `ip=` (egress-IP
+    // bound) and rarely include HLS, but it's the only working
+    // backup when IOS itself fails.
     private let clientChain: [(name: String, version: String, userAgent: String)] = [
         (
             "IOS",
@@ -94,39 +106,6 @@ final class YouTubeStreamResolver {
             "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
         ),
     ]
-
-    /// Long-track chain. Prioritizes clients that return
-    /// `hlsManifestUrl` (HLS segments are per-chunk signed, so the
-    /// IP-bound failure that kills progressive MP4 URLs on 20+ min
-    /// tracks doesn't apply). Sticky reorder is intentionally skipped.
-    ///
-    /// Order:
-    ///   1. `IOS_MUSIC` — YouTube Music iOS app. HLS for music
-    ///      content, no PO Token grace window (still open), no
-    ///      signature cipher in response.
-    ///   2. `TVHTML5_SIMPLY_EMBEDDED_PLAYER` — embedded-player
-    ///      variant used by yt-dlp to bypass the "Sign in to confirm
-    ///      you're not a bot" wall. Requires `thirdParty.embedUrl`.
-    ///   3. `IOS` — v20. Backs up the music client for non-music
-    ///      long content.
-    ///   4. `ANDROID_VR` — absolute last resort. URLs are IP-bound
-    ///      on long tracks, but better than hard fail.
-    private var longTrackChain: [(name: String, version: String, userAgent: String)] {
-        [
-            (
-                "IOS_MUSIC",
-                "7.11.2",
-                "com.google.ios.youtubemusic/7.11.2 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X)"
-            ),
-            (
-                "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-                "2.0",
-                "Mozilla/5.0 (PlayStation; PlayStation 4/12.02) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
-            ),
-            clientChain[0],  // IOS (v20)
-            clientChain[1],  // ANDROID_VR
-        ]
-    }
 
     /// Name of the client whose last resolve succeeded. Next resolve
     /// tries this client first so repeated plays avoid wasting a round
@@ -400,14 +379,15 @@ final class YouTubeStreamResolver {
     /// moved to the front. First play of the session runs the static
     /// order; subsequent plays skip the rediscovery cost.
     ///
-    /// Long-track mode skips the sticky reorder — HLS availability
-    /// (which only IOS / TVHTML5 / WEB provide) matters more than a
-    /// saved RTT, and ANDROID_VR sticking from a prior short-track
-    /// success would starve the HLS path.
+    /// Long-track mode skips the sticky reorder — IOS is the only
+    /// client that still returns `hlsManifestUrl` and HLS is required
+    /// for IP-bound-URL safety on >1200 s tracks. If a prior
+    /// short-track ANDROID_VR success was sticky, we'd starve the HLS
+    /// path on the next long track without this skip.
     private func orderedChain(forLongTrack: Bool = false) -> [(name: String, version: String, userAgent: String)] {
         if forLongTrack {
-            logger.info("🧪 DBG long-track chain order: \(self.longTrackChain.map(\.name).joined(separator: " → "), privacy: .public)")
-            return longTrackChain
+            logger.info("🧪 DBG long-track chain order: \(self.clientChain.map(\.name).joined(separator: " → "), privacy: .public)")
+            return clientChain
         }
         lastClientLock.lock()
         let cached = lastSuccessfulClient
@@ -520,27 +500,11 @@ final class YouTubeStreamResolver {
             clientCtx["osName"] = "iOS"
             clientCtx["osVersion"] = "18.3.1.22D72"
             clientCtx["platform"] = "MOBILE"
-        case "IOS_MUSIC":
-            clientCtx["deviceMake"] = "Apple"
-            clientCtx["deviceModel"] = "iPhone16,2"
-            clientCtx["osName"] = "iOS"
-            clientCtx["osVersion"] = "18.3.1.22D72"
-            clientCtx["platform"] = "MOBILE"
-        case "TVHTML5_SIMPLY_EMBEDDED_PLAYER":
-            clientCtx["clientScreen"] = "EMBED"
-            clientCtx["platform"] = "TV"
         default:
             break
         }
 
-        // Build `context` as mutable dict so TVHTML5_SIMPLY_EMBEDDED_
-        // PLAYER can add the top-level `thirdParty.embedUrl` required
-        // to bypass the bot-wall. All other clients get the minimal
-        // `{client: ...}` shape unchanged.
-        var contextObj: [String: Any] = ["client": clientCtx]
-        if client.name == "TVHTML5_SIMPLY_EMBEDDED_PLAYER" {
-            contextObj["thirdParty"] = ["embedUrl": "https://www.youtube.com"]
-        }
+        let contextObj: [String: Any] = ["client": clientCtx]
 
         let body: [String: Any] = [
             "videoId": id,

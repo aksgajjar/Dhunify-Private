@@ -52,6 +52,8 @@ final class CarPlayNowPlayingUpdater {
             _ = playerViewModel.isPlaying
             _ = playerViewModel.currentTime
             _ = playerViewModel.duration
+            _ = playerViewModel.isShuffled
+            _ = playerViewModel.repeatMode
             _ = LibraryStore.shared.likedSongs
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
@@ -60,7 +62,7 @@ final class CarPlayNowPlayingUpdater {
             }
         }
         update()
-        refreshHeartButton()
+        refreshNowPlayingButtons()
     }
 
     // MARK: - Now Playing mirror
@@ -240,35 +242,63 @@ final class CarPlayNowPlayingUpdater {
         }
     }
 
-    // MARK: - Heart button
+    // MARK: - Now Playing buttons
 
-    /// Installs (or refreshes) the heart `CPNowPlayingImageButton` on
-    /// `CPNowPlayingTemplate.shared`. The icon reflects whether the
-    /// current song is in `LibraryStore.shared.likedSongs`. Tapping
-    /// toggles the like state and re-fires this method so the icon
-    /// flips immediately.
-    ///
-    /// Apple's Now Playing template allows up to 5 image buttons. We
-    /// install exactly one — well within the cap.
-    private func refreshHeartButton() {
+    /// Installs the trio of Now Playing buttons on
+    /// `CPNowPlayingTemplate.shared`: shuffle (left), heart (center),
+    /// repeat (right). Shuffle and repeat use Apple's dedicated CarPlay
+    /// subclasses so head units render standard icons + active state
+    /// and route taps through the system. Heart stays a custom image
+    /// button. The observation loop in `scheduleObservation()`
+    /// re-fires this method on every state change so visuals flip.
+    private func refreshNowPlayingButtons() {
         guard let song = playerViewModel.currentSong else {
             CPNowPlayingTemplate.shared.updateNowPlayingButtons([])
             return
         }
-        let liked = LibraryStore.shared.isLiked(song)
-        let symbol = liked ? "heart.fill" : "heart"
-        let tint: UIColor = liked ? .systemPink : .white
-        let cfg = UIImage.SymbolConfiguration(pointSize: 36, weight: .semibold)
-        let img = UIImage(systemName: symbol, withConfiguration: cfg)?
-            .withTintColor(tint, renderingMode: .alwaysOriginal) ?? UIImage()
-        let button = CPNowPlayingImageButton(image: img) { _ in
+
+        let shuffleButton = CPNowPlayingShuffleButton { [weak self] _ in
             Task { @MainActor in
-                _ = LibraryStore.shared.toggleLike(song)
-                // No explicit refresh needed — the observation in
-                // scheduleObservation() catches likedSongs change and
-                // re-fires refreshHeartButton via the loop.
+                self?.playerViewModel.toggleShuffle()
             }
         }
-        CPNowPlayingTemplate.shared.updateNowPlayingButtons([button])
+
+        let repeatButton = CPNowPlayingRepeatButton { [weak self] _ in
+            Task { @MainActor in
+                self?.playerViewModel.toggleRepeat()
+            }
+        }
+
+        let cfg = UIImage.SymbolConfiguration(pointSize: 36, weight: .semibold)
+        let liked = LibraryStore.shared.isLiked(song)
+        let heartSymbol = liked ? "heart.fill" : "heart"
+        let heartTint: UIColor = liked ? .systemPink : .white
+        let heartImage = UIImage(systemName: heartSymbol, withConfiguration: cfg)?
+            .withTintColor(heartTint, renderingMode: .alwaysOriginal) ?? UIImage()
+        let heartButton = CPNowPlayingImageButton(image: heartImage) { _ in
+            Task { @MainActor in
+                _ = LibraryStore.shared.toggleLike(song)
+            }
+        }
+
+        CPNowPlayingTemplate.shared.updateNowPlayingButtons([shuffleButton, heartButton, repeatButton])
+        syncRemoteCommandShuffleRepeatState()
+    }
+
+    /// Mirrors VM shuffle/repeat state into MPRemoteCommandCenter so
+    /// the system Now Playing surfaces (CarPlay button glow, lock
+    /// screen) reflect the current toggle without a fresh tap.
+    private func syncRemoteCommandShuffleRepeatState() {
+        let center = MPRemoteCommandCenter.shared()
+        center.changeShuffleModeCommand.currentShuffleType =
+            playerViewModel.isShuffled ? .items : .off
+        switch playerViewModel.repeatMode {
+        case .off:
+            center.changeRepeatModeCommand.currentRepeatType = .off
+        case .all:
+            center.changeRepeatModeCommand.currentRepeatType = .all
+        case .one:
+            center.changeRepeatModeCommand.currentRepeatType = .one
+        }
     }
 }

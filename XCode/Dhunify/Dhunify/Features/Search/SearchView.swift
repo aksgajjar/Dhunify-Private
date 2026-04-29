@@ -418,10 +418,14 @@ private struct SearchContent: View {
 
     @ViewBuilder
     private var albumContent: some View {
-        if viewModel.isLoading && viewModel.albumResults.isEmpty {
+        if viewModel.isLoading && viewModel.albumResults.isEmpty && viewModel.results.isEmpty {
             loadingList
-        } else if viewModel.albumResults.isEmpty {
+        } else if viewModel.albumResults.isEmpty && viewModel.results.isEmpty {
             albumEmptyState
+        } else if viewModel.albumResults.isEmpty {
+            // Fallback: backend returned no albums for this query. Reuse the
+            // song results so the Albums tab never feels broken or empty.
+            albumFallbackSongs
         } else {
             ScrollView {
                 sectionHeader(title: "Albums", count: viewModel.albumResults.count)
@@ -442,6 +446,40 @@ private struct SearchContent: View {
             }
             .scrollDismissesKeyboard(.immediately)
         }
+    }
+
+    // Album tab fallback when backend /search/albums returns nothing:
+    // surface the YT music-shelf / video-shelf songs so the tab is useful
+    // instead of empty. Tapping a row plays from the song list like the
+    // Songs tab does.
+    private var albumFallbackSongs: some View {
+        ScrollView {
+            sectionHeader(title: "Results", count: viewModel.results.count)
+                .padding(.horizontal, 20)
+                .padding(.top, 6)
+                .padding(.bottom, 4)
+
+            LazyVStack(spacing: 12) {
+                ForEach(Array(viewModel.results.enumerated()), id: \.element.id) { index, song in
+                    SongRowView(
+                        song: song,
+                        isDownloading: downloadManager.activeDownloads.contains(song.youtubeID),
+                        isAlreadyDownloaded: downloadManager.isDownloaded(song.youtubeID),
+                        isCurrentlyPlaying: AppContainer.shared.playerViewModel.currentSong?.youtubeID == song.youtubeID,
+                        highlightQuery: viewModel.query,
+                        onDownload: {
+                            downloadManager.download(song: song)
+                        },
+                        onTap: {
+                            router.presentPlayer(queue: viewModel.results, startIndex: index)
+                        }
+                    )
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 24)
+        }
+        .scrollDismissesKeyboard(.immediately)
     }
 
     // Shared section header — count hint mirrors Spotify's "N results".
@@ -646,13 +684,22 @@ struct SongRowView: View {
                             .lineLimit(1)
                         SourceBadge(song: song)
                     }
-                    NavigationLink(value: song.artist) {
-                        Text(searchHighlighted(song.artist, match: highlightQuery,
-                                               base: .appSecondary))
-                            .font(.appCaption)
-                            .lineLimit(1)
+                    HStack(spacing: 4) {
+                        NavigationLink(value: song.artist) {
+                            Text(searchHighlighted(song.artist, match: highlightQuery,
+                                                   base: .appSecondary))
+                                .font(.appCaption)
+                                .lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
+                        .layoutPriority(1)
+                        if song.isYouTubeSource, let meta = songMetaText(song, leadingBullet: true) {
+                            meta
+                                .font(.appCaption)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
                     }
-                    .buttonStyle(.plain)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -834,4 +881,62 @@ struct SkeletonRowView: View {
             }
         }
     }
+}
+
+// MARK: - Song row / card meta (views + duration)
+//
+// Shared between Search rows and Home horizontal cards. Views segment is
+// accent-colored + semibold, duration is secondary. `leadingBullet = true`
+// prepends " • " for use directly after an artist text (Search). Set to
+// `false` for standalone lines (Home cards beneath artist).
+
+/// Composed `Text` combining view count and duration. Returns `nil` when
+/// neither segment is present (safely hides). View count is only carried on
+/// YouTube videoRenderer results via `Song.viewCount`.
+func songMetaText(_ song: Song, leadingBullet: Bool = true) -> Text? {
+    let sep = Text(" • ").foregroundColor(.appSecondary)
+    var parts: [Text] = []
+    if let v = song.viewCount, v > 0 {
+        parts.append(
+            Text(searchFormatViews(v))
+                .foregroundColor(.appAccent)
+                .fontWeight(.semibold)
+        )
+    }
+    if song.duration > 0 {
+        parts.append(
+            Text(searchFormatDurationShort(song.duration))
+                .foregroundColor(.appSecondary)
+        )
+    }
+    guard let first = parts.first else { return nil }
+    var body = first
+    for p in parts.dropFirst() {
+        body = body + sep + p
+    }
+    return leadingBullet ? (sep + body) : body
+}
+
+func searchFormatViews(_ n: Int64) -> String {
+    func fmt(_ val: Double, _ suffix: String) -> String {
+        let rounded = (val * 10).rounded() / 10
+        if rounded == rounded.rounded() {
+            return "\(Int(rounded))\(suffix) views"
+        }
+        return String(format: "%.1f%@ views", rounded, suffix)
+    }
+    if n >= 1_000_000_000 { return fmt(Double(n) / 1_000_000_000, "B") }
+    if n >= 1_000_000 { return fmt(Double(n) / 1_000_000, "M") }
+    if n >= 1_000 { return fmt(Double(n) / 1_000, "K") }
+    return "\(n) views"
+}
+
+func searchFormatDurationShort(_ d: TimeInterval) -> String {
+    let total = Int(d)
+    if total < 60 { return "\(total) sec" }
+    let minutes = total / 60
+    if minutes < 60 { return "\(minutes) min" }
+    let hours = minutes / 60
+    let rem = minutes % 60
+    return rem == 0 ? "\(hours)h" : "\(hours)h \(rem)m"
 }

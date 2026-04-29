@@ -17,6 +17,9 @@ struct PlaylistDetailView: View {
     @State private var isLoading = true
     @State private var isEditing = false
     @State private var showAddSongs = false
+    @State private var showRename = false
+    @State private var renameText = ""
+    @State private var showDeleteConfirm = false
 
     private var playlist: UserPlaylist? { pm.playlist(for: playlistID) }
 
@@ -133,6 +136,23 @@ struct PlaylistDetailView: View {
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(.appAccent)
                     }
+                    Menu {
+                        Button {
+                            renameText = playlist?.name ?? ""
+                            showRename = true
+                        } label: {
+                            Label("Rename", systemImage: "pencil")
+                        }
+                        Button(role: .destructive) {
+                            showDeleteConfirm = true
+                        } label: {
+                            Label("Delete Playlist", systemImage: "trash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(.appAccent)
+                    }
                 }
             }
         }
@@ -143,28 +163,54 @@ struct PlaylistDetailView: View {
             .presentationDetents([.large])
             .presentationDragIndicator(.visible)
         }
+        .alert("Rename Playlist", isPresented: $showRename) {
+            TextField("Playlist name", text: $renameText)
+            Button("Cancel", role: .cancel) {}
+            Button("Save") {
+                pm.renamePlaylist(playlistID, to: renameText)
+            }
+        }
+        .alert("Delete Playlist?", isPresented: $showDeleteConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                pm.deletePlaylist(playlistID)
+                dismiss()
+            }
+        } message: {
+            Text("This will remove the playlist. Songs stay in your library.")
+        }
         .task { await loadSongs() }
     }
 
     private func loadSongs() async {
         guard let playlist else { isLoading = false; return }
-        // Fetch song details for each ID in the playlist.
-        var loaded: [Song] = []
-        for songID in playlist.songIDs {
-            guard var components = URLComponents(string: Config.backendBaseURL) else { continue }
-            components.path = "/song/\(songID)"
-            guard let url = components.url else { continue }
-            do {
-                let (data, _) = try await URLSession.shared.data(from: url)
-                struct SongDTO: Decodable {
-                    let title: String; let artist: String; let thumbnailURL: String
-                    let youtubeID: String; let duration: TimeInterval
+        let ids = playlist.songIDs
+        // Parallel fetch — sequential /song/<id> calls froze the screen
+        // on playlists with >3 songs. Bounded by songIDs count (max 100s).
+        struct SongDTO: Decodable {
+            let title: String; let artist: String; let thumbnailURL: String
+            let youtubeID: String; let duration: TimeInterval
+        }
+        let loaded: [Song] = await withTaskGroup(of: (Int, Song?).self) { group in
+            for (idx, songID) in ids.enumerated() {
+                group.addTask {
+                    guard var components = URLComponents(string: Config.backendBaseURL) else { return (idx, nil) }
+                    components.path = "/song/\(songID)"
+                    guard let url = components.url else { return (idx, nil) }
+                    do {
+                        let (data, _) = try await URLSession.shared.data(from: url)
+                        let dto = try JSONDecoder().decode(SongDTO.self, from: data)
+                        return (idx, Song(title: dto.title, artist: dto.artist, thumbnailURL: dto.thumbnailURL, youtubeID: dto.youtubeID, duration: dto.duration))
+                    } catch {
+                        return (idx, nil)
+                    }
                 }
-                let dto = try JSONDecoder().decode(SongDTO.self, from: data)
-                loaded.append(Song(title: dto.title, artist: dto.artist, thumbnailURL: dto.thumbnailURL, youtubeID: dto.youtubeID, duration: dto.duration))
-            } catch {
-                // Song might not resolve — skip it
             }
+            var buf: [(Int, Song)] = []
+            for await (idx, song) in group {
+                if let song { buf.append((idx, song)) }
+            }
+            return buf.sorted { $0.0 < $1.0 }.map { $0.1 }
         }
         songs = loaded
         isLoading = false

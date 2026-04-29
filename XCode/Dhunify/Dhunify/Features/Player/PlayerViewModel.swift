@@ -9,7 +9,9 @@
 
 import Foundation
 import AVFoundation
+import AVKit
 import MediaPlayer
+import Network
 import SwiftUI
 import UIKit
 import os
@@ -139,7 +141,28 @@ final class PlayerViewModel {
     private var timeControlObservation: NSKeyValueObservation?
     @ObservationIgnored nonisolated(unsafe) private var timeObserverToken: Any?
     @ObservationIgnored nonisolated(unsafe) private var stopAllAudioObserver: NSObjectProtocol?
+    @ObservationIgnored nonisolated(unsafe) private var airPlayRouteObserver: NSObjectProtocol?
+    /// Cached artwork image for the currently-loaded song. Used by the
+    /// AirPlay route handler to push artwork into `AVPlayerItem.externalMetadata`
+    /// when an Apple TV / AirPlay receiver becomes active mid-playback,
+    /// without re-downloading the image. Lock-screen / CarPlay paths
+    /// continue to use `MPNowPlayingInfoCenter` and are untouched.
+    @ObservationIgnored private var lastArtworkImage: UIImage?
+    @ObservationIgnored private var lastArtworkSongID: String?
     private var wantsToPlay: Bool = false
+    /// True while an in-flight `player.seek(...)` has not yet hit its
+    /// completion handler. The periodic time observer reads this and
+    /// skips its tick so a stale `player.currentTime()` reading from
+    /// before the seek lands can't snap the UI back to the old
+    /// position.
+    private var isSeeking: Bool = false
+    /// Timestamp of the most recent successful `seek()` completion.
+    /// Stall-recovery uses this to apply a 5s grace window after user
+    /// scrubs — large HLS jumps put AVPlayer into `.waiting` for
+    /// several seconds while a new segment range is fetched, which
+    /// would otherwise trip the 8s recovery debounce and snap the UI
+    /// to 0 via `replaceCurrentItem`.
+    @ObservationIgnored nonisolated(unsafe) private var lastSeekFinishedAt: Date?
     /// Safety watchdog for `playPendingFeedback`. If `.playing` never
     /// fires (resolver error, network stall) the flag would stick, so
     /// we force-clear it after 5s. The normal clear path is
@@ -152,9 +175,6 @@ final class PlayerViewModel {
     /// most likely (IP shift between resolve and first frame). Nil
     /// means actual playback hasn't started yet.
     @ObservationIgnored nonisolated(unsafe) private var playbackStartedAt: Date?
-    /// One-shot guard so the recovery path can't loop if the fresh
-    /// URL also stalls. Cleared on every new `loadCurrentSong`.
-    @ObservationIgnored nonisolated(unsafe) private var stallRecoveryAttempted: Bool = false
     /// Single source of truth for the YouTube stream's duration as
     /// reported by the resolver. Authoritative for probe-skip, the
     /// stability guard, stall-recovery gating, and telemetry — since
@@ -174,6 +194,47 @@ final class PlayerViewModel {
     private var pendingYTFallbackURL: URL?
     private var ytFallbackWatchdog: Task<Void, Never>?
     private var ytFallbackUsed: Bool = false
+    /// One-shot guard for the backend yt-dlp fallback. When the
+    /// client-side InnerTube chain returns an unplayable URL (403 /
+    /// "permission denied" / "no stream"), we swap the AVPlayerItem to
+    /// the backend's proxy stream URL once per load. Loop-proof: never
+    /// re-fires on the replacement item, and resets only on a fresh
+    /// `loadCurrentSong`.
+    private var backendFallbackUsed: Bool = false
+    /// Watchdog for AVPlayerItems that never reach `.readyToPlay` and
+    /// never surface `.failed`. HLS manifests with path-segment IP
+    /// binding (`/ip/<addr>/`) routinely 403 on segment fetches but
+    /// AVPlayer hangs in `.unknown` rather than failing cleanly, so the
+    /// `.failed` branch (where backend fallback lives) never fires.
+    /// This task fires after a fixed delay and triggers the same
+    /// backend fallback path. Cancelled on `.readyToPlay`, `.failed`,
+    /// and on every fresh load.
+    @ObservationIgnored nonisolated(unsafe) private var unknownStatusWatchdog: Task<Void, Never>?
+
+    // MARK: - Network adaptive
+
+    /// NWPathMonitor watching for cellular ↔ wifi ↔ constrained changes.
+    /// Lets the player widen the buffer + cap the HLS bitrate when the
+    /// driver is on a weak link, so songs ride out forest / tunnel
+    /// dead zones instead of freezing.
+    @ObservationIgnored private var pathMonitor: NWPathMonitor?
+    /// Debounce task: scheduled when AVPlayer enters a stall and
+    /// cancelled when it returns to playing. If the timer fires before
+    /// playback resumes, we kick the stall-recovery re-resolve path.
+    /// Replaces the previous "fire on every .waiting / .paused" wiring
+    /// which would have churned now that
+    /// `automaticallyWaitsToMinimizeStalling=true` makes those events
+    /// routine during normal rebuffer.
+    @ObservationIgnored nonisolated(unsafe) private var stallDebounceTask: Task<Void, Never>?
+    /// Cooldown timestamp for stall recovery — prevents tight loops
+    /// while still allowing repeated recoveries through long drives.
+    @ObservationIgnored nonisolated(unsafe) private var lastRecoveryAt: Date?
+    /// Cooldown timestamp for path-change-driven re-resolves.
+    @ObservationIgnored nonisolated(unsafe) private var lastPathChangeRecoveryAt: Date?
+    /// Latest snapshot of the network path. Read on the main actor to
+    /// pick buffer / peak-bitrate settings for new items.
+    @ObservationIgnored private var isOnCellular: Bool = false
+    @ObservationIgnored private var isConstrainedNetwork: Bool = false
 
     // MARK: - Init
 
@@ -181,21 +242,22 @@ final class PlayerViewModel {
         self.queue = queue
         self.currentIndex = max(0, min(currentIndex, max(queue.count - 1, 0)))
 
-        // Start playback as soon as AVPlayerItem reaches readyToPlay.
-        // Default is `true`, which makes AVPlayer buffer extra data
-        // before playing — adds 1-3s startup lag on long tracks.
-        // Disabled here: AVPlayer still continues buffering while
-        // playing, but doesn't delay first sample.
-        player.automaticallyWaitsToMinimizeStalling = false
-        playerB.automaticallyWaitsToMinimizeStalling = false
-        preloaderPlayer.automaticallyWaitsToMinimizeStalling = false
+        // Mid-play stalls (cell handover, weak signal, dead zone): let
+        // AVPlayer auto-pause + refill + auto-resume on its own. Startup
+        // is still instant because every code path uses
+        // `playImmediately(atRate:)`, which bypasses this flag.
+        player.automaticallyWaitsToMinimizeStalling = true
+        playerB.automaticallyWaitsToMinimizeStalling = true
+        preloaderPlayer.automaticallyWaitsToMinimizeStalling = true
         preloaderPlayer.volume = 0
 
         configureAudioSession()
         observeInterruptions()
         observeTimeControl()
         observeStopAllAudio()
+        observeAirPlayRoute()
         setupRemoteCommands()
+        startNetworkPathMonitor()
         loadCurrentSong()
     }
 
@@ -229,6 +291,12 @@ final class PlayerViewModel {
     /// pull more songs from the same section the user started from.
     var categorySeed: String?
 
+    /// Absolute seconds to seek to once the next AVPlayerItem reaches
+    /// .readyToPlay. Set by the Resume App Intent before setQueue so
+    /// CarPlay restarts continue from saved position instead of 0.
+    /// Cleared after a single successful seek so it never carries over.
+    var pendingResumeSeconds: TimeInterval?
+
     /// Restore queue state without auto-playing. Used on app launch to
     /// show the last song in the mini player without starting audio.
     func restoreQueue(_ queue: [Song], startIndex: Int) {
@@ -248,6 +316,8 @@ final class PlayerViewModel {
     deinit {
         crossfadeTask?.cancel()
         progressTask?.cancel()
+        stallDebounceTask?.cancel()
+        pathMonitor?.cancel()
         if let token = timeObserverToken {
             player.removeTimeObserver(token)
         }
@@ -258,6 +328,9 @@ final class PlayerViewModel {
             NotificationCenter.default.removeObserver(observer)
         }
         if let observer = stopAllAudioObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = airPlayRouteObserver {
             NotificationCenter.default.removeObserver(observer)
         }
     }
@@ -286,6 +359,10 @@ final class PlayerViewModel {
                     Self.logger.info("⏯️ timeControlStatus → PLAYING")
                     self.isPlaying = true
                     self.clearPlayFeedback()
+                    // Healthy playback — cancel any pending recovery
+                    // debounce so a brief rebuffer doesn't escalate to
+                    // a full re-resolve.
+                    self.cancelStallRecoveryCheck()
                     if self.playbackStartedAt == nil {
                         self.playbackStartedAt = Date()
                         // Telemetry: first-audio moment per load. Not
@@ -301,14 +378,19 @@ final class PlayerViewModel {
                 case .paused:
                     Self.logger.info("⏯️ timeControlStatus → PAUSED")
                     self.isPlaying = false
-                    // Unexpected pause (user didn't tap pause) within
-                    // the recovery window on an IP-bound URL = likely
-                    // IP change. Recovery gate decides whether to act.
-                    self.maybeTriggerStallRecovery(reason: "paused")
+                    // Schedule a debounced recovery check. If wantsToPlay
+                    // is false (user tapped pause), the gate inside
+                    // `maybeTriggerStallRecovery` no-ops. Otherwise an
+                    // 8-second timer arms a re-resolve.
+                    self.scheduleStallRecoveryCheck(reason: "paused")
                 case .waitingToPlayAtSpecifiedRate:
                     let reason = player.reasonForWaitingToPlay?.rawValue ?? "unknown"
                     Self.logger.info("⏯️ timeControlStatus → WAITING (\(reason))")
-                    self.maybeTriggerStallRecovery(reason: "waiting:\(reason)")
+                    // With automaticallyWaitsToMinimizeStalling=true,
+                    // this fires on every normal rebuffer. Debounce so
+                    // we only escalate to a re-resolve when the stall
+                    // outlasts the buffer's natural recovery.
+                    self.scheduleStallRecoveryCheck(reason: "waiting:\(reason)")
                 @unknown default:
                     break
                 }
@@ -348,6 +430,85 @@ final class PlayerViewModel {
         }
     }
 
+    // MARK: - AirPlay external metadata
+    //
+    // Apple TV / AirPlay-audio receivers render Now Playing UI from
+    // `AVPlayerItem.externalMetadata`, NOT from `MPNowPlayingInfoCenter`.
+    // The lock-screen / CarPlay path stays on `MPNowPlayingInfoCenter`
+    // and is intentionally left alone. We only attach external metadata
+    // while an AirPlay route is the active output, and clear it when
+    // the route reverts to local playback so we don't leak metadata
+    // into unrelated AVPlayer sessions.
+
+    private func observeAirPlayRoute() {
+        airPlayRouteObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleAirPlayRouteChange()
+            }
+        }
+    }
+
+    private func isAirPlayRouteActive() -> Bool {
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        return outputs.contains { output in
+            switch output.portType {
+            case .airPlay:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    private func handleAirPlayRouteChange() {
+        if isAirPlayRouteActive() {
+            applyExternalMetadataForAirPlay()
+        } else {
+            clearExternalMetadataForAirPlay()
+        }
+    }
+
+    private func applyExternalMetadataForAirPlay() {
+        guard let item = player.currentItem, let song = currentSong else { return }
+
+        var items: [AVMetadataItem] = []
+
+        let title = AVMutableMetadataItem()
+        title.identifier = .commonIdentifierTitle
+        title.value = song.title as NSString
+        title.extendedLanguageTag = "und"
+        items.append(title)
+
+        let artist = AVMutableMetadataItem()
+        artist.identifier = .commonIdentifierArtist
+        artist.value = song.artist as NSString
+        artist.extendedLanguageTag = "und"
+        items.append(artist)
+
+        if
+            lastArtworkSongID == song.youtubeID,
+            let image = lastArtworkImage,
+            let data = image.jpegData(compressionQuality: 0.85)
+        {
+            let art = AVMutableMetadataItem()
+            art.identifier = .commonIdentifierArtwork
+            art.value = data as NSData
+            art.dataType = "public.jpeg"
+            art.extendedLanguageTag = "und"
+            items.append(art)
+        }
+
+        item.externalMetadata = items
+    }
+
+    private func clearExternalMetadataForAirPlay() {
+        player.currentItem?.externalMetadata = []
+    }
+
     private func handleInterruption(typeRaw: UInt?, optionsRaw: UInt?) {
         guard
             let rawType = typeRaw,
@@ -372,14 +533,96 @@ final class PlayerViewModel {
         }
     }
 
+    // MARK: - Network adaptive playback
+
+    /// Picks the forward-buffer target based on current network. Cell
+    /// or constrained: 60 s so we ride out forest / tunnel dead zones.
+    /// WiFi: 30 s — still generous, but less RAM pressure when there's
+    /// no signal anxiety. Returned in seconds. AVPlayer treats this as
+    /// a cap on how far ahead it will fetch.
+    private var preferredForwardBufferDurationForCurrentNetwork: TimeInterval {
+        return (isOnCellular || isConstrainedNetwork) ? 60 : 30
+    }
+
+    /// Caps the HLS variant AVPlayer is allowed to pick. 64 kbps on
+    /// cellular keeps audio playing on weak signal; 0 (unlimited) on
+    /// WiFi lets AVPlayer choose freely. Has no effect on progressive
+    /// (non-HLS) streams — those just ignore it.
+    private var preferredPeakBitRateForCurrentNetwork: Double {
+        return (isOnCellular || isConstrainedNetwork) ? 64_000 : 0
+    }
+
+    /// Starts the NWPathMonitor watcher. Updates `isOnCellular` /
+    /// `isConstrainedNetwork`, then re-applies adaptive settings on the
+    /// current AVPlayerItem and (for YouTube tracks) kicks a single
+    /// re-resolve so the IP-bound URL gets refreshed when the device
+    /// hops between 5G ↔ LTE or WiFi ↔ cell.
+    private func startNetworkPathMonitor() {
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            let cellular = path.usesInterfaceType(.cellular)
+            let constrained = path.isConstrained || path.isExpensive
+            Task { @MainActor [weak self] in
+                self?.handleNetworkPathChange(isCellular: cellular, isConstrained: constrained)
+            }
+        }
+        monitor.start(queue: DispatchQueue.global(qos: .utility))
+    }
+
+    private func handleNetworkPathChange(isCellular: Bool, isConstrained: Bool) {
+        let prevCellular = isOnCellular
+        let prevConstrained = isConstrainedNetwork
+        isOnCellular = isCellular
+        isConstrainedNetwork = isConstrained
+        let changed = prevCellular != isCellular || prevConstrained != isConstrained
+        guard changed else { return }
+        Self.logger.info("🌐 path changed cellular=\(isCellular) constrained=\(isConstrained)")
+        applyNetworkAdaptiveSettings()
+        // On hop from one bearer to another (most common on highway),
+        // YouTube IP-bound URLs lose their binding and stall a few
+        // seconds later. Force a single re-resolve now — cooldown
+        // protects against churn if the path flaps.
+        if let last = lastPathChangeRecoveryAt,
+           Date().timeIntervalSince(last) < 30 { return }
+        lastPathChangeRecoveryAt = Date()
+        guard wantsToPlay,
+              let song = currentSong, song.isYouTubeSource,
+              let asset = player.currentItem?.asset as? AVURLAsset,
+              Self.urlIsIPBound(asset.url) else { return }
+        Self.logger.info("🌐 path change on IP-bound YT URL — re-resolving")
+        performStallRecovery(for: song, resumeAt: currentTime)
+    }
+
+    /// Pushes the current network's adaptive settings onto the active
+    /// AVPlayerItem. Safe to call repeatedly — both properties are
+    /// idempotent.
+    private func applyNetworkAdaptiveSettings() {
+        guard let item = player.currentItem else { return }
+        item.preferredForwardBufferDuration = preferredForwardBufferDurationForCurrentNetwork
+        item.preferredPeakBitRate = preferredPeakBitRateForCurrentNetwork
+    }
+
     // MARK: - Loading
 
     private func loadCurrentSong() {
-        isLoadingCurrentSong = true
-        // Stall-recovery window restarts with each new load. `playbackStartedAt`
-        // gets set to the instant `.playing` first fires for this load.
+        guard Date().timeIntervalSince(lastLoadTime) > 0.8 else {
+            Self.logger.info("⛔️ loadCurrentSong skipped — cooldown active")
+            return
+        }
+        guard !isLoadingItem else {
+            Self.logger.info("⛔️ loadCurrentSong skipped — load already in progress")
+            return
+        }
+        lastLoadTime = Date()
+        isLoadingItem = true
+        // Stall-recovery state restarts with each new load.
+        // `playbackStartedAt` gets set to the instant `.playing` first
+        // fires; `lastRecoveryAt` is cleared so the 30s cooldown
+        // doesn't carry over to a fresh song.
         playbackStartedAt = nil
-        stallRecoveryAttempted = false
+        lastRecoveryAt = nil
+        cancelStallRecoveryCheck()
         // IMMEDIATELY stop old audio — no gap.
         player.pause()
         player.volume = volume // reset from any crossfade
@@ -391,6 +634,9 @@ final class PlayerViewModel {
         ytFallbackWatchdog = nil
         pendingYTFallbackURL = nil
         ytFallbackUsed = false
+        backendFallbackUsed = false
+        unknownStatusWatchdog?.cancel()
+        unknownStatusWatchdog = nil
 
         // Drop stale preload state if it was for a different song. Keep
         // it intact when the user advances to the preload target — the
@@ -431,6 +677,7 @@ final class PlayerViewModel {
             progress = 0
             dominantColor = .appSurface
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            isLoadingItem = false
             return
         }
 
@@ -447,11 +694,13 @@ final class PlayerViewModel {
             player.replaceCurrentItem(with: nil)
             isPlaying = false
             playbackError = "Could not build playback URL"
+            isLoadingItem = false
             return
         }
 
         // Reset preload state for this new song.
         hasPreloadedNext = false
+        hasPrefetchedNextL2 = false
 
         Self.logger.info("🎵 [1/5] Loading: \(song.title)")
         Self.logger.info("🎵 [2/5] Stream URL: \(streamURL.absoluteString)")
@@ -494,10 +743,20 @@ final class PlayerViewModel {
             // Reset here so the prior track's duration can't leak into
             // this load's probe-skip / guard / telemetry decisions.
             self.ytStreamDuration = 0
-            // Preloaded URLs are only honoured for non-YouTube tracks.
-            // Rule: always resolve YouTube fresh at play time because
-            // googlevideo URLs are IP + session-signed and go stale.
-            if let preloaded = preloadedURL,
+
+            // L2 disk cache fast path. When a previous play (or a
+            // Wi-Fi pre-download) wrote this song's audio to
+            // `Caches/audio/`, we skip every InnerTube round trip and
+            // hand AVPlayer a `file://` URL. Local files are
+            // IP-independent + survive any signal state, so the
+            // IP-bound stability guard, the long-track block, and the
+            // unknown-hang watchdog all become no-ops below
+            // (`urlIsIPBound` / `urlIsHLS` return false on file URLs).
+            if let l2 = await AudioDiskCache.shared.cachedFileURL(for: song.youtubeID) {
+                finalURL = l2
+                self.ytStreamDuration = song.duration
+                Self.logger.info("⚡️ L2 disk cache hit \(song.youtubeID, privacy: .public)")
+            } else if let preloaded = preloadedURL,
                preloadedSongID == song.youtubeID,
                !song.isYouTubeSource {
                 finalURL = preloaded
@@ -548,7 +807,7 @@ final class PlayerViewModel {
                         let nse = error as NSError
                         Self.logger.error("🧪 DBG YT resolver FAILED domain=\(nse.domain) code=\(nse.code) desc=\(error.localizedDescription)")
                         playbackError = "Couldn't resolve this track. Try another."
-                        isLoadingCurrentSong = false
+                        isLoadingItem = false
                         self.clearPlayFeedback(animated: false)
                         preloadedURL = nil
                         preloadedSongID = nil
@@ -584,46 +843,45 @@ final class PlayerViewModel {
             // path. Long / unknown-duration tracks pay one extra round
             // trip for a stable URL. On failure we keep the original —
             // graceful degradation over hard stop.
-            // Only re-resolve when BOTH:
-            //   - duration is known AND > 1200s (≈20min+), and
-            //   - the current URL is IP-bound (carries `ip=`).
-            // Short tracks keep the fast path untouched. Unknown duration
-            // (== 0) is treated as "could be short" → no extra round trip.
+            // Stability: reject IP-bound URLs for ALL YouTube tracks,
+            // not just long ones. Any duration can stall when egress IP
+            // shifts mid-play. `resolveStable` loops every InnerTube
+            // client until a non-IP-bound URL lands (prefers HLS /
+            // manifest.googlevideo.com); throws if none available.
             if song.isYouTubeSource,
                Self.urlIsIPBound(finalURL) {
                 let guardDuration = self.ytStreamDuration > 0 ? self.ytStreamDuration : song.duration
-                if guardDuration > 1200 {
-                    Self.logger.info("⚠️ IP-bound URL on long track dur=\(Int(guardDuration))s — attempting stable re-resolve")
-                    do {
-                        let stable = try await YouTubeStreamResolver.shared.resolveStable(videoID: song.youtubeID, expectedDuration: guardDuration)
-                        finalURL = stable.url
-                        pendingYTFallbackURL = stable.fallbackURL
-                        if stable.duration > 0 { self.ytStreamDuration = stable.duration }
-                        Self.logger.info("✅ stable URL replaced host=\(stable.url.host ?? "?")")
-                    } catch {
-                        Self.logger.info("⚠️ stable re-resolve failed, keeping IP-bound URL: \(error.localizedDescription)")
-                    }
+                Self.logger.info("⚠️ IP-bound URL detected dur=\(Int(guardDuration))s — attempting stable re-resolve")
+                do {
+                    let stable = try await YouTubeStreamResolver.shared.resolveStable(videoID: song.youtubeID, expectedDuration: guardDuration)
+                    finalURL = stable.url
+                    pendingYTFallbackURL = stable.fallbackURL
+                    if stable.duration > 0 { self.ytStreamDuration = stable.duration }
+                    Self.logger.info("✅ stable URL replaced host=\(stable.url.host ?? "?")")
+                } catch {
+                    Self.logger.info("⚠️ stable re-resolve failed: \(error.localizedDescription)")
                 }
             }
 
-            // Hard block: long IP-bound streams are known to stall mid-
-            // playback when the CDN rejects the bound IP. If we reach
-            // this point still IP-bound on a long track, the stable
-            // re-resolve above already failed — there is no recovery
-            // path left. Fail fast instead of handing AVPlayer a URL
-            // that will stick in buffering then pause.
-            // HLS is exempt: segments are signed per-chunk so the IP
-            // binding failure mode doesn't apply.
+            // Hard block ONLY long IP-bound YT streams. Short tracks on
+            // IP-bound URLs play fine in the ~15-min window before the
+            // egress IP shifts; blocking them is over-protection that
+            // kills normal Bollywood tracks. Long tracks (>1200s) don't
+            // fit that window and stall mid-playback, so the re-resolve
+            // failure IS fatal there. HLS exempt: per-chunk signed.
             let blockDuration = self.ytStreamDuration > 0 ? self.ytStreamDuration : song.duration
             if song.isYouTubeSource,
                !Self.urlIsHLS(finalURL),
                Self.urlIsIPBound(finalURL),
                blockDuration > 1200 {
-                Self.logger.error("❌ BLOCKED: long IP-bound stream — not playable")
+                Self.logger.error("❌ BLOCKED: long IP-bound stream dur=\(Int(blockDuration))s — not playable")
                 self.playbackError = "This long track is not playable. Try another version."
-                self.isLoadingCurrentSong = false
+                self.isLoadingItem = false
                 self.isPlaying = false
                 return
+            }
+            if song.isYouTubeSource, Self.urlIsIPBound(finalURL), !Self.urlIsHLS(finalURL) {
+                Self.logger.info("⚠️ IP-bound URL allowed (dur=\(Int(blockDuration))s ≤ 1200s) — playing with fallback")
             }
 
             Self.logger.info("🎵 [3/5] Final URL: \(finalURL.host ?? "?") (\(finalURL.absoluteString.count) chars)")
@@ -713,26 +971,25 @@ final class PlayerViewModel {
             // Safety: if the preloaded item reached .failed while
             // buffering (bad network, expired URL, 403), drop it and
             // fall through to a fresh `AVPlayerItem(url:)` build.
-            let item: AVPlayerItem
-            if let preItem = self.takePreloadedItem(songID: song.youtubeID, allowFailed: false) {
-                item = preItem
-                Self.logger.info("🔮 Installing preloaded AVPlayerItem (YT=\(song.isYouTubeSource), status=\(item.status.rawValue))")
-            } else {
-                if self.takePreloadedItem(songID: song.youtubeID, allowFailed: true) != nil {
-                    Self.logger.info("🔮 Preloaded item was .failed — falling back to fresh load")
-                }
-                item = AVPlayerItem(url: playURL)
-            }
-            // Ask AVPlayer to buffer only a small amount ahead before
-            // readyToPlay. Smaller forward buffer = faster first-
-            // sample-out, fewer bytes before readyToPlay fires.
-            // AVPlayer keeps refilling during playback so short stalls
-            // self-heal. Long YT tracks drop to 1s to trim further;
-            // low bitrate (48-128kbps) means 1s of audio is only
-            // ~6-16KB and is plenty to transition into refill mode.
-            let longYT = song.isYouTubeSource && warmupDuration > 1200
-            item.preferredForwardBufferDuration = longYT ? 1 : 2
-            Self.logger.info("🎵 [3b/5] AVPlayerItem URL scheme=\(playURL.scheme ?? "?") isFile=\(playURL.isFileURL) bufferSec=\(longYT ? 1 : 2)")
+            // iOS 26 forbids an AVPlayerItem from being attached to more
+            // than one AVPlayer instance. Always build a fresh item
+            // from the resolved URL — drop any preload slot so the
+            // warmer player is cleared, but never hand its item back.
+            _ = self.takePreloadedItem(songID: song.youtubeID, allowFailed: false)
+            _ = self.takePreloadedItem(songID: song.youtubeID, allowFailed: true)
+            let item = AVPlayerItem(url: playURL)
+            // Adaptive forward buffer: 60 s on cellular / constrained
+            // networks (forest, tunnels), 30 s on WiFi. Combined with
+            // `automaticallyWaitsToMinimizeStalling=true` this lets
+            // playback ride out signal blackouts without freezing.
+            // Peak-bitrate cap on cellular pulls HLS variants down to
+            // ~64 kbps so the buffer fills even on weak signal.
+            // Startup latency unaffected — every play path uses
+            // `playImmediately(atRate:)`, which fires as soon as the
+            // first sample lands regardless of buffer level.
+            item.preferredForwardBufferDuration = preferredForwardBufferDurationForCurrentNetwork
+            item.preferredPeakBitRate = preferredPeakBitRateForCurrentNetwork
+            Self.logger.info("🎵 [3b/5] AVPlayerItem URL scheme=\(playURL.scheme ?? "?") isFile=\(playURL.isFileURL) bufferSec=\(self.preferredForwardBufferDurationForCurrentNetwork) peakBR=\(self.preferredPeakBitRateForCurrentNetwork)")
 
             // KVO: observe item.status to know when it's ready or failed.
             itemStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] playerItem, _ in
@@ -742,11 +999,15 @@ final class PlayerViewModel {
                     case .readyToPlay:
                         let dur = playerItem.duration.seconds
                         Self.logger.info("🎵 [4/5] READY — duration: \(dur)s")
+                        // Item produced a status — kill the unknown-hang
+                        // watchdog so it can't fire after the fact.
+                        self.unknownStatusWatchdog?.cancel()
+                        self.unknownStatusWatchdog = nil
                         if dur.isFinite, dur > 0 {
                             self.duration = dur
                         }
                         self.isBuffering = false
-                        self.isLoadingCurrentSong = false
+                        self.isLoadingItem = false
                         // Auto-play when ready. playImmediately skips
                         // AVPlayer's buffer-fill heuristic — starts
                         // now even if only a small buffer is present.
@@ -755,6 +1016,33 @@ final class PlayerViewModel {
                             self.player.playImmediately(atRate: self.playbackSpeed)
                             self.isPlaying = true
                             self.updateNowPlayingPlaybackState()
+                        }
+                        // Resume-from-saved-position: only fires when
+                        // an external surface (App Intent) armed it
+                        // before setQueue. Skip entirely if the item
+                        // didn't report a finite, positive duration —
+                        // seeking against an indefinite/NaN duration
+                        // can land outside the playable range.
+                        if let resumeAt = self.pendingResumeSeconds {
+                            self.pendingResumeSeconds = nil
+                            let rawDur = playerItem.duration
+                            let durSecs = rawDur.isIndefinite ? .nan : rawDur.seconds
+                            if !durSecs.isFinite || durSecs <= 0 {
+                                Self.logger.info("⏪ Resume skipped — item duration unreliable")
+                            } else if resumeAt > 3, resumeAt < durSecs - 5 {
+                                let target = CMTime(seconds: resumeAt, preferredTimescale: 600)
+                                self.player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                                    Task { @MainActor [weak self] in
+                                        guard let self else { return }
+                                        self.currentTime = resumeAt
+                                        self.progress = resumeAt / durSecs
+                                        self.updateNowPlayingPlaybackState()
+                                    }
+                                }
+                                Self.logger.info("⏪ Resume seek armed → \(Int(resumeAt))s of \(Int(durSecs))s")
+                            } else {
+                                Self.logger.info("⏪ Resume skipped — position \(Int(resumeAt))s out of valid window")
+                            }
                         }
                         // Fire-and-forget mirror into hot cache AFTER
                         // playback is live. JioSaavn only — YT URLs are
@@ -765,6 +1053,10 @@ final class PlayerViewModel {
                     case .failed:
                         let err = playerItem.error?.localizedDescription ?? "unknown"
                         Self.logger.error("🎵 FAILED: \(err)")
+                        // Item failed cleanly — no need for the
+                        // unknown-hang watchdog any more.
+                        self.unknownStatusWatchdog?.cancel()
+                        self.unknownStatusWatchdog = nil
                         // webm/opus safety fallback — if an mp4 fallback
                         // was armed for this load, swap to it instead of
                         // surfacing the error.
@@ -773,6 +1065,19 @@ final class PlayerViewModel {
                            song.isYouTubeSource {
                             Self.logger.info("🎵 webm failed → fallback mp4")
                             self.swapToYTFallback(url: fb, song: song)
+                            return
+                        }
+                        // Backend yt-dlp fallback — covers 403 /
+                        // "permission denied" / "no stream" errors that
+                        // the client-side InnerTube chain produces when
+                        // YouTube hands back an IP-bound URL or a
+                        // LOGIN_REQUIRED response. One-shot per load,
+                        // resumes from currentTime so the user doesn't
+                        // restart from 0:00.
+                        if !self.backendFallbackUsed, song.isYouTubeSource {
+                            Self.logger.info("🎵 client resolve failed → backend yt-dlp fallback")
+                            let resumeAt = self.currentTime
+                            self.swapToBackendYTStream(song: song, resumeAt: resumeAt)
                             return
                         }
                         // ───── DEBUG TRACE (STRICT DEBUG MODE) ─────
@@ -800,7 +1105,7 @@ final class PlayerViewModel {
                         self.playbackError = err
                         self.isBuffering = false
                         self.isPlaying = false
-                        self.isLoadingCurrentSong = false
+                        self.isLoadingItem = false
                         self.clearPlayFeedback(animated: false)
                     case .unknown:
                         Self.logger.info("🎵 Status: unknown (buffering...)")
@@ -815,11 +1120,59 @@ final class PlayerViewModel {
                 item.audioMix = mix
             }
 
-            // Set the item on the player.
+            // Set the item on the player. Always detach preloaderPlayer
+            // first — iOS 26 rejects an AVPlayerItem that is still
+            // associated with another AVPlayer, and the `===` guard
+            // isn't reliable across all preload paths.
+            preloaderPlayer.replaceCurrentItem(with: nil)
             player.replaceCurrentItem(with: item)
             player.volume = volume
             observeEndOfItem(item)
             installTimeObserver()
+
+            // L2 disk cache writeback. Background-download the same
+            // URL into `Caches/audio/` so the next replay of this
+            // song bypasses the network entirely. Best-effort: failure
+            // has zero impact on the now-playing item. Skipped when:
+            //   - We're already playing from a local file URL.
+            //   - URL is HLS — `.m3u8` only stores the manifest, not
+            //     audio bytes; would defeat the cache. Long YT tracks
+            //     hit this path; AVPlayer's own segment buffer covers
+            //     them at runtime.
+            if !playURL.isFileURL, !Self.urlIsHLS(playURL) {
+                let cacheURL = playURL
+                let cacheID = song.youtubeID
+                Task.detached(priority: .background) {
+                    _ = await AudioDiskCache.shared.store(songID: cacheID, sourceURL: cacheURL)
+                }
+            }
+
+            // Unknown-status hang watchdog. HLS manifests with
+            // path-segment IP binding (manifest.googlevideo.com /ip/.../)
+            // can leave AVPlayer stuck in `.unknown` indefinitely when
+            // segment fetches 403 — `.failed` never fires, so the
+            // backend fallback in the `.failed` branch never gets a
+            // chance to run. If we don't reach `.readyToPlay` within
+            // 8 s on a YouTube load, force the backend swap so the
+            // user gets audio instead of an infinite spinner. One-shot
+            // per load, gated by `backendFallbackUsed`.
+            unknownStatusWatchdog?.cancel()
+            if song.isYouTubeSource {
+                unknownStatusWatchdog = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: 8_000_000_000)
+                    if Task.isCancelled { return }
+                    await MainActor.run {
+                        guard let self else { return }
+                        guard self.currentSong?.youtubeID == song.youtubeID else { return }
+                        guard self.wantsToPlay, !self.backendFallbackUsed else { return }
+                        guard let current = self.player.currentItem,
+                              current.status != .readyToPlay,
+                              current.status != .failed else { return }
+                        Self.logger.info("⏰ unknown-hang watchdog → backend fallback for \(song.youtubeID)")
+                        self.swapToBackendYTStream(song: song, resumeAt: self.currentTime)
+                    }
+                }
+            }
 
             // Kick playback immediately instead of waiting for the
             // KVO readyToPlay callback. Setting `player.rate` before
@@ -900,35 +1253,40 @@ final class PlayerViewModel {
         }
     }
 
-    /// Stall-recovery gate. Called from time-control observers when
-    /// the player drops out of `.playing` (to `.paused` or `.waiting`)
-    /// unexpectedly. All conditions must pass or we no-op:
+    /// Stall-recovery gate. Called from `scheduleStallRecoveryCheck`
+    /// after a debounce when the player has been stuck in `.paused` or
+    /// `.waiting` long enough to exceed AVPlayer's natural rebuffer.
+    /// Conditions:
     ///   1. User still wants playback (guards against tap-pause).
-    ///   2. Playback actually started for this load (else it's a
-    ///      startup stall, handled elsewhere).
-    ///   3. Within 30s of first `.playing` — the IP-change failure
-    ///      window. Later stalls are usually cause-unknown and a
-    ///      fresh URL won't help.
-    ///   4. Current item URL carries `ip=` — the only case where a
-    ///      fresh resolve is meaningful.
-    ///   5. Not already attempted for this load — one shot per load.
+    ///   2. Playback actually started for this load (startup stalls go
+    ///      through the unknown-status / fallback paths instead).
+    ///   3. Source is YouTube AND current URL is IP-bound — only case
+    ///      where a fresh `resolveStable` produces a different URL.
+    ///      For non-YT sources (JioSaavn, backend `/stream`, downloads)
+    ///      we rely on AVPlayer's auto-rebuffer
+    ///      (`automaticallyWaitsToMinimizeStalling=true`).
+    ///   4. Cooldown: at least 30s since the last recovery so we never
+    ///      churn even if the fresh URL is also weak.
     private func maybeTriggerStallRecovery(reason: String) {
         guard wantsToPlay,
-              !stallRecoveryAttempted,
-              let startedAt = playbackStartedAt else { return }
-        let elapsed = Date().timeIntervalSince(startedAt)
-        guard elapsed < 30 else { return }
+              playbackStartedAt != nil else { return }
+        // User-initiated seek window. Large HLS jumps can keep
+        // AVPlayer in `.waiting` for >8s while a new segment range
+        // lands; without this guard the debounce would fire a
+        // re-resolve + replaceCurrentItem and snap the UI to 0.
+        if isSeeking { return }
+        if let lastSeek = lastSeekFinishedAt,
+           Date().timeIntervalSince(lastSeek) < 5 { return }
+        if let last = lastRecoveryAt,
+           Date().timeIntervalSince(last) < 30 { return }
         guard let song = currentSong, song.isYouTubeSource else { return }
         guard let asset = player.currentItem?.asset as? AVURLAsset,
               Self.urlIsIPBound(asset.url) else { return }
-        // Long-track-only: short tracks with IP-bound URLs don't usually
-        // outlive the IP binding, so recovery churn isn't worth it.
-        let stallDuration = ytStreamDuration > 0 ? ytStreamDuration : song.duration
-        guard stallDuration > 1200 else { return }
 
-        stallRecoveryAttempted = true
+        let stallDuration = ytStreamDuration > 0 ? ytStreamDuration : song.duration
+        lastRecoveryAt = Date()
         let resumeAt = currentTime
-        Self.logger.info("⚠️ stall \(reason) at \(Int(elapsed))s on IP-bound long-track — re-resolving stable")
+        Self.logger.info("⚠️ stall \(reason) on IP-bound URL — re-resolving stable")
         PlaybackTelemetry.shared.logStall(
             songID: song.youtubeID,
             durationSec: Int(stallDuration),
@@ -939,6 +1297,26 @@ final class PlayerViewModel {
             durationSec: Int(stallDuration)
         )
         performStallRecovery(for: song, resumeAt: resumeAt)
+    }
+
+    /// Arm an 8-second timer. If `cancelStallRecoveryCheck` doesn't
+    /// fire before then, `maybeTriggerStallRecovery` runs. 8 s is
+    /// chosen to outlast AVPlayer's typical rebuffer window (~3-5 s)
+    /// while still feeling responsive on the road.
+    private func scheduleStallRecoveryCheck(reason: String) {
+        stallDebounceTask?.cancel()
+        stallDebounceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.maybeTriggerStallRecovery(reason: reason)
+        }
+    }
+
+    /// Cancels any pending recovery debounce. Called from the
+    /// `.playing` branch when AVPlayer recovers on its own.
+    private func cancelStallRecoveryCheck() {
+        stallDebounceTask?.cancel()
+        stallDebounceTask = nil
     }
 
     private func performStallRecovery(for song: Song, resumeAt: TimeInterval) {
@@ -982,7 +1360,8 @@ final class PlayerViewModel {
             }
 
             let item = AVPlayerItem(url: fresh.url)
-            item.preferredForwardBufferDuration = 2
+            item.preferredForwardBufferDuration = preferredForwardBufferDurationForCurrentNetwork
+            item.preferredPeakBitRate = preferredPeakBitRateForCurrentNetwork
             if let mix = await EQManager.shared.createAudioMix(for: item) {
                 item.audioMix = mix
             }
@@ -995,19 +1374,23 @@ final class PlayerViewModel {
                         self.isBuffering = false
                         if resumeAt > 0 {
                             let t = CMTime(seconds: resumeAt, preferredTimescale: 600)
-                            self.player.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero)
+                            // Indefinite tolerance — fresh HLS manifest
+                            // may not have the exact keyframe in its
+                            // initial seekableTimeRanges. Frame-accurate
+                            // seek there clamps near 0; nearest-keyframe
+                            // lands cleanly.
+                            self.player.seek(to: t, toleranceBefore: .indefinite, toleranceAfter: .indefinite)
                         }
                         if self.wantsToPlay {
                             self.player.playImmediately(atRate: self.playbackSpeed)
                             self.isPlaying = true
                             self.updateNowPlayingPlaybackState()
                         }
-                        // Playback stable on the replacement item — release
-                        // the one-shot latch. The elapsed<30s window on
-                        // `maybeTriggerStallRecovery` still prevents repeat
-                        // firings, so this can't drive a loop.
+                        // Playback stable on the replacement item.
+                        // Cooldown on `maybeTriggerStallRecovery`
+                        // (30 s since `lastRecoveryAt`) prevents a
+                        // recovery loop even though the latch is gone.
                         Self.logger.info("✅ recovered long-track playback")
-                        self.stallRecoveryAttempted = false
                         let durInt = Int(self.ytStreamDuration > 0 ? self.ytStreamDuration : song.duration)
                         PlaybackTelemetry.shared.logRecoveryOutcome(
                             songID: song.youtubeID, durationSec: durInt, succeeded: true
@@ -1036,6 +1419,105 @@ final class PlayerViewModel {
     /// down the existing status observer and wires a fresh one. Called
     /// from the status=.failed branch and the 3s watchdog. Marked used
     /// so it can't recurse.
+    /// Backend yt-dlp fallback. Builds a backend proxy URL for the
+    /// current YT video, replaces the AVPlayerItem in place, and seeks
+    /// to `resumeAt` once the new item is ready so playback resumes
+    /// from the same timestamp. The backend endpoint is expected to
+    /// stream / redirect to a fresh, IP-stable audio URL on demand.
+    /// One-shot per load via `backendFallbackUsed`.
+    private func swapToBackendYTStream(song: Song, resumeAt: TimeInterval) {
+        backendFallbackUsed = true
+        unknownStatusWatchdog?.cancel()
+        unknownStatusWatchdog = nil
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = nil
+
+        // Backend `/stream?id=yt_{id}` 302-redirects to a Cloudflare
+        // Worker that proxies audio/mp4 bytes from googlevideo. The
+        // Worker uses its own egress IP, so the IP-bound URL trap
+        // that breaks the on-device InnerTube path doesn't apply.
+        let rawID = song.youtubeID.hasPrefix("yt_") ? song.youtubeID : "yt_\(song.youtubeID)"
+        guard var components = URLComponents(string: Config.backendBaseURL) else {
+            Self.logger.error("🎵 [backend-fallback] invalid backendBaseURL")
+            playbackError = "Unable to play this track"
+            isBuffering = false
+            isPlaying = false
+            isLoadingItem = false
+            return
+        }
+        components.path = "/stream"
+        components.queryItems = [URLQueryItem(name: "id", value: rawID)]
+        guard let url = components.url else {
+            Self.logger.error("🎵 [backend-fallback] failed to build URL for \(rawID)")
+            playbackError = "Unable to play this track"
+            isBuffering = false
+            isPlaying = false
+            isLoadingItem = false
+            return
+        }
+        Self.logger.info("🎵 [backend-fallback] swap → \(url.absoluteString) resumeAt=\(Int(resumeAt))s")
+
+        let item = AVPlayerItem(url: url)
+        item.preferredForwardBufferDuration = preferredForwardBufferDurationForCurrentNetwork
+            item.preferredPeakBitRate = preferredPeakBitRateForCurrentNetwork
+
+        itemStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] playerItem, _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                switch playerItem.status {
+                case .readyToPlay:
+                    let dur = playerItem.duration.seconds
+                    Self.logger.info("🎵 [backend-fallback] READY — duration: \(dur)s")
+                    if dur.isFinite, dur > 0 { self.duration = dur }
+                    self.isBuffering = false
+                    self.isLoadingItem = false
+                    // Seek to last-known position before resuming so the
+                    // user doesn't start over.
+                    let rawDur = playerItem.duration
+                    let durSecs = rawDur.isIndefinite ? .nan : rawDur.seconds
+                    if resumeAt > 1, durSecs.isFinite, durSecs > 0, resumeAt < durSecs - 1 {
+                        let target = CMTime(seconds: resumeAt, preferredTimescale: 600)
+                        self.player.seek(to: target, toleranceBefore: .indefinite, toleranceAfter: .indefinite) { [weak self] _ in
+                            Task { @MainActor [weak self] in
+                                guard let self else { return }
+                                self.currentTime = resumeAt
+                                if durSecs > 0 { self.progress = resumeAt / durSecs }
+                                self.updateNowPlayingPlaybackState()
+                                if self.wantsToPlay {
+                                    self.player.playImmediately(atRate: self.playbackSpeed)
+                                    self.isPlaying = true
+                                    self.updateNowPlayingPlaybackState()
+                                }
+                            }
+                        }
+                    } else if self.wantsToPlay {
+                        self.player.playImmediately(atRate: self.playbackSpeed)
+                        self.isPlaying = true
+                        self.updateNowPlayingPlaybackState()
+                    }
+                case .failed:
+                    let err = playerItem.error?.localizedDescription ?? "unknown"
+                    Self.logger.error("🎵 [backend-fallback] FAILED: \(err)")
+                    self.playbackError = err
+                    self.isBuffering = false
+                    self.isPlaying = false
+                    self.isLoadingItem = false
+                case .unknown:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+        }
+        Task { @MainActor in
+            if let mix = await EQManager.shared.createAudioMix(for: item) {
+                item.audioMix = mix
+            }
+            self.player.replaceCurrentItem(with: item)
+            self.observeEndOfItem(item)
+        }
+    }
+
     private func swapToYTFallback(url: URL, song: Song) {
         ytFallbackUsed = true
         pendingYTFallbackURL = nil
@@ -1045,7 +1527,8 @@ final class PlayerViewModel {
         itemStatusObservation = nil
 
         let item = AVPlayerItem(url: url)
-        item.preferredForwardBufferDuration = 2
+        item.preferredForwardBufferDuration = preferredForwardBufferDurationForCurrentNetwork
+            item.preferredPeakBitRate = preferredPeakBitRateForCurrentNetwork
         itemStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] playerItem, _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -1055,11 +1538,32 @@ final class PlayerViewModel {
                     Self.logger.info("🎵 [fallback] READY — duration: \(dur)s")
                     if dur.isFinite, dur > 0 { self.duration = dur }
                     self.isBuffering = false
-                    self.isLoadingCurrentSong = false
+                    self.isLoadingItem = false
                     if self.wantsToPlay {
                         self.player.playImmediately(atRate: self.playbackSpeed)
                         self.isPlaying = true
                         self.updateNowPlayingPlaybackState()
+                    }
+                    if let resumeAt = self.pendingResumeSeconds {
+                        self.pendingResumeSeconds = nil
+                        let rawDur = playerItem.duration
+                        let durSecs = rawDur.isIndefinite ? .nan : rawDur.seconds
+                        if !durSecs.isFinite || durSecs <= 0 {
+                            Self.logger.info("⏪ [fallback] Resume skipped — item duration unreliable")
+                        } else if resumeAt > 3, resumeAt < durSecs - 5 {
+                            let target = CMTime(seconds: resumeAt, preferredTimescale: 600)
+                            self.player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                                Task { @MainActor [weak self] in
+                                    guard let self else { return }
+                                    self.currentTime = resumeAt
+                                    self.progress = resumeAt / durSecs
+                                    self.updateNowPlayingPlaybackState()
+                                }
+                            }
+                            Self.logger.info("⏪ [fallback] Resume seek armed → \(Int(resumeAt))s of \(Int(durSecs))s")
+                        } else {
+                            Self.logger.info("⏪ [fallback] Resume skipped — position \(Int(resumeAt))s out of valid window")
+                        }
                     }
                 case .failed:
                     let err = playerItem.error?.localizedDescription ?? "unknown"
@@ -1067,7 +1571,7 @@ final class PlayerViewModel {
                     self.playbackError = err
                     self.isBuffering = false
                     self.isPlaying = false
-                    self.isLoadingCurrentSong = false
+                    self.isLoadingItem = false
                 case .unknown:
                     break
                 @unknown default:
@@ -1103,6 +1607,9 @@ final class PlayerViewModel {
     }
 
     private var hasPreloadedNext = false
+    /// One-shot guard for the L2 disk pre-download per load. Reset in
+    /// `loadCurrentSong` and on track-advance helpers.
+    private var hasPrefetchedNextL2 = false
     private var preloadedURL: URL?
     private var preloadedSongID: String?
     /// Tier 1 preload — YT fallback mp4 URL captured at resolve time so
@@ -1130,12 +1637,18 @@ final class PlayerViewModel {
     }
     private var preloadedItems: [Int: PreloadedItemSlot] = [:]
     private let maxPreloadSlots = 2
-    /// Guards against overlapping `loadCurrentSong` calls. Without this
-    /// the sequence nextTrack() → loadCurrentSong() → play() spawns a
-    /// second loadCurrentSong because `player.currentItem` is still
-    /// nil when play() inspects it, producing duplicate stream
-    /// resolves and a race between two AVPlayerItem installs.
-    private var isLoadingCurrentSong = false
+    /// Single source of truth guarding overlapping `loadCurrentSong`
+    /// calls. Rapid Next taps or the sequence nextTrack() →
+    /// loadCurrentSong() → play() can otherwise fire multiple loads in
+    /// the same main-actor hop, producing duplicate stream resolves
+    /// and racing AVPlayerItem installs. All load entry points use
+    /// this same guard; every early-exit and completion path resets it.
+    private var isLoadingItem = false
+
+    /// Rate-limits rapid `loadCurrentSong` calls (spam Next, mood tap,
+    /// preload overlap). A 0.8s cooldown coalesces bursts into a single
+    /// load without needing to plumb debouncing into every caller.
+    private var lastLoadTime: Date = .distantPast
 
     /// Phase 2 prefetch handles. Each setQueue() cancels the previous
     /// batch so a fast queue change (tap A → tap B before A loads)
@@ -1167,6 +1680,10 @@ final class PlayerViewModel {
     private func handleTimeUpdate(_ time: CMTime) {
         let secs = time.seconds
         guard secs.isFinite else { return }
+        // Suppress observer writes while a seek is in flight — otherwise
+        // a stale player.currentTime() reading would snap the UI back
+        // to the pre-seek position.
+        guard !isSeeking else { return }
         currentTime = secs
 
         // Pick up duration if it wasn't known at load time.
@@ -1194,6 +1711,22 @@ final class PlayerViewModel {
             preloadNextSong()
         }
 
+        // L2 disk pre-download: when current track is past 50% AND we
+        // are on Wi-Fi (or unconstrained), fetch the next track's
+        // bytes into `Caches/audio/` so a sudden dead zone on advance
+        // still plays from disk. Cellular path skipped — preload
+        // already buffers ~60 s ahead in memory, and downloading a
+        // full track over LTE would burn data even when the user
+        // never advances. One-shot per load via `hasPrefetchedNextL2`.
+        if progress >= 0.5,
+           !hasPrefetchedNextL2,
+           duration > 0,
+           !isOnCellular,
+           !isConstrainedNetwork {
+            hasPrefetchedNextL2 = true
+            prefetchNextOnWiFi()
+        }
+
         // End-of-track volume behavior.
         if duration > 5 && (duration - secs) <= crossfadeDuration && (duration - secs) > 0 {
             if crossfadeEnabled {
@@ -1209,7 +1742,72 @@ final class PlayerViewModel {
         }
     }
 
+    /// L2 disk pre-download for the next track. Resolves the URL via
+    /// the existing in-memory resolver cache (cheap if already warmed
+    /// by `preloadNextSong`) then writes the audio bytes to the L2
+    /// disk cache. Wi-Fi only — caller is expected to have gated on
+    /// `!isOnCellular && !isConstrainedNetwork`.
+    private func prefetchNextOnWiFi() {
+        guard let nextIdx = nextIndex(), queue.indices.contains(nextIdx) else {
+            return
+        }
+        let nextSong = queue[nextIdx]
+        Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+            // Skip work entirely if already on disk.
+            if await AudioDiskCache.shared.cachedFileURL(for: nextSong.youtubeID) != nil {
+                return
+            }
+            // Resolve URL.
+            let resolvedURL: URL?
+            if nextSong.isYouTubeSource {
+                resolvedURL = (try? await YouTubeStreamResolver.shared
+                    .resolve(videoID: nextSong.youtubeID, expectedDuration: nextSong.duration))?.url
+            } else {
+                resolvedURL = await self.resolveBackendStreamURL(for: nextSong)
+            }
+            guard let url = resolvedURL else { return }
+            // HLS manifests are tiny pointers — caching the .m3u8
+            // doesn't store audio bytes. Skip; the in-memory preload
+            // already buffers the first segments.
+            if await Self.urlIsHLS(url) { return }
+            _ = await AudioDiskCache.shared.store(songID: nextSong.youtubeID, sourceURL: url)
+        }
+    }
+
+    /// Resolves the backend `/stream?id=` URL through its 302 redirect
+    /// to the underlying CF Worker / CDN URL so we can hand a stable
+    /// fetchable URL to `AudioDiskCache.store`.
+    private nonisolated func resolveBackendStreamURL(for song: Song) async -> URL? {
+        guard var components = URLComponents(string: Config.backendBaseURL) else { return nil }
+        components.path = "/stream"
+        components.queryItems = [URLQueryItem(name: "id", value: song.youtubeID)]
+        guard let url = components.url else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "HEAD"
+        // Don't follow — let URLSession surface the Location so we can
+        // download from the underlying URL directly. URLSession follows
+        // by default; we use `data(for:)` and inspect the final URL.
+        req.timeoutInterval = 8
+        do {
+            let (_, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse,
+                  let finalURL = http.url else { return url }
+            return finalURL
+        } catch {
+            return url
+        }
+    }
+
     private func preloadNextSong() {
+        // Don't kick off preload work while the main player is mid-load.
+        // Two resolver chains in flight fight each other on the network
+        // and can race AVPlayerItem installs. Caller re-fires the 30%
+        // preload gate on later time-ticks, so skipping here is safe.
+        guard !isLoadingItem else {
+            Self.logger.info("⛔️ preloadNextSong skipped — main load in progress")
+            return
+        }
         // Compute both target slots. offset==0 = index+1 (attaches to
         // warmer for buffer heat), offset==1 = index+2 (cold prebuild).
         let targetIdx1 = nextIndex()
@@ -1360,7 +1958,8 @@ final class PlayerViewModel {
                     Self.logger.info("🔮 Preloaded YT URL [\(queueIndex)] in \(ms)ms host=\(resolved.url.host ?? "?") fallback=\(resolved.fallbackURL != nil) dur=\(Int(resolved.duration))s")
 
                     let item = AVPlayerItem(url: resolved.url)
-                    item.preferredForwardBufferDuration = 1
+                    item.preferredForwardBufferDuration = preferredForwardBufferDurationForCurrentNetwork
+                    item.preferredPeakBitRate = preferredPeakBitRateForCurrentNetwork
                     if let mix = await EQManager.shared.createAudioMix(for: item) {
                         item.audioMix = mix
                     }
@@ -1389,7 +1988,8 @@ final class PlayerViewModel {
             Self.logger.info("🔮 Preloaded JIO URL [\(queueIndex)] in \(ms)ms host=\(resolved.host ?? "?")")
 
             let item = AVPlayerItem(url: resolved)
-            item.preferredForwardBufferDuration = 2
+            item.preferredForwardBufferDuration = preferredForwardBufferDurationForCurrentNetwork
+            item.preferredPeakBitRate = preferredPeakBitRateForCurrentNetwork
             if let mix = await EQManager.shared.createAudioMix(for: item) {
                 item.audioMix = mix
             }
@@ -1431,9 +2031,11 @@ final class PlayerViewModel {
             let failed = slot.item.status == .failed
             if allowFailed != failed { continue }
             preloadedItems.removeValue(forKey: idx)
-            if preloaderPlayer.currentItem === slot.item {
-                preloaderPlayer.replaceCurrentItem(with: nil)
-            }
+            // Always detach the warmer before handing the item back.
+            // iOS 26 rejects re-attachment if any previous association
+            // persists — identity check (===) can miss items that were
+            // briefly warmer but have since been replaced.
+            preloaderPlayer.replaceCurrentItem(with: nil)
             return slot.item
         }
         return nil
@@ -1653,7 +2255,7 @@ final class PlayerViewModel {
             // in-flight one. The KVO observer on item.status will
             // pick up `wantsToPlay` and start playback as soon as
             // the pending load reaches .readyToPlay.
-            if isLoadingCurrentSong {
+            if isLoadingItem {
                 Self.logger.info("▶️ play() — load already in flight, will auto-start on readyToPlay")
                 return
             }
@@ -1742,7 +2344,17 @@ final class PlayerViewModel {
         progress = 0
         queue = []
         currentIndex = 0
+        isLoadingItem = false
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    }
+
+    /// Lightweight hook for CarPlay disconnect. Clears only the load
+    /// lock so a subsequent reconnect can't race a stale in-flight
+    /// load. Leaves the player, current item, and audio session intact
+    /// — playback continues on phone speaker / headphones exactly like
+    /// Spotify / Apple Music.
+    func resetForCarPlayDisconnect() {
+        isLoadingItem = false
     }
 
     func seek(to progress: Double) {
@@ -1750,12 +2362,26 @@ final class PlayerViewModel {
         let clamped = max(0, min(progress, 1))
         let targetSeconds = duration * clamped
         let target = CMTime(seconds: targetSeconds, preferredTimescale: 600)
-        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+        // Indefinite tolerance lets AVPlayer land on the nearest keyframe
+        // instead of forcing a frame-accurate fetch. On progressive YT
+        // URLs (and HLS chunks) this avoids an exact-byte range request
+        // that would otherwise stall the buffer for multi-minute jumps.
+        isSeeking = true
+        player.seek(to: target, toleranceBefore: .indefinite, toleranceAfter: .indefinite) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.currentTime = targetSeconds
                 self.progress = clamped
                 self.updateNowPlayingPlaybackState()
+                // Long jumps can transition AVPlayer to `.paused` /
+                // `.waitingToPlayAtSpecifiedRate` while it backfills.
+                // The user expected playback to continue, so re-issue
+                // the rate command if that's still their intent.
+                if self.wantsToPlay, !self.isPlaying {
+                    self.player.playImmediately(atRate: self.playbackSpeed)
+                }
+                self.isSeeking = false
+                self.lastSeekFinishedAt = Date()
             }
         }
     }
@@ -2002,7 +2628,8 @@ final class PlayerViewModel {
             // identical.
             self.crossfadeLoader = nil
             let itemB = AVPlayerItem(url: finalURL)
-            itemB.preferredForwardBufferDuration = 2
+            itemB.preferredForwardBufferDuration = preferredForwardBufferDurationForCurrentNetwork
+            itemB.preferredPeakBitRate = preferredPeakBitRateForCurrentNetwork
             if !finalURL.isFileURL, nextSong.youtubeID.hasPrefix("jio_") {
                 HotCacheManager.shared.cache(songID: nextSong.youtubeID, from: finalURL)
             }
@@ -2042,25 +2669,40 @@ final class PlayerViewModel {
                 self.endOfItemObserver = nil
             }
 
-            if let incomingItem = self.playerB.currentItem {
-                self.player.replaceCurrentItem(with: incomingItem)
+            if let incomingItem = self.playerB.currentItem,
+               let incomingURL = (incomingItem.asset as? AVURLAsset)?.url {
+                // iOS 26 forbids sharing AVPlayerItem across AVPlayer
+                // instances. Build a fresh item from the resolved URL
+                // and tear down playerB before the hand-off.
+                let freshBuffer = incomingItem.preferredForwardBufferDuration
+                let freshMix = incomingItem.audioMix
+
+                self.playerB.replaceCurrentItem(with: nil)
+
+                let freshItem = AVPlayerItem(url: incomingURL)
+                freshItem.preferredForwardBufferDuration = freshBuffer
+                freshItem.audioMix = freshMix
+
+                self.player.replaceCurrentItem(with: freshItem)
                 self.player.volume = v
                 self.player.seek(to: incomingTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in }
                 self.player.rate = self.playbackSpeed
-                self.observeEndOfItem(incomingItem)
+                self.observeEndOfItem(freshItem)
 
                 // Refresh duration for the new item so UI + progress work.
-                let d = incomingItem.duration.seconds
+                let d = freshItem.duration.seconds
                 if d.isFinite, d > 0 { self.duration = d }
+            } else {
+                self.playerB.replaceCurrentItem(with: nil)
             }
 
-            self.playerB.replaceCurrentItem(with: nil)
             self.playerB.volume = 0
 
             // Advance logical queue state without running loadCurrentSong
             // (that would re-resolve the URL and re-create the item).
             self.currentIndex = nextIdx
             self.hasPreloadedNext = false
+            self.hasPrefetchedNextL2 = false
             self.isPlaying = true
             self.setupNowPlaying()
             self.updateNowPlayingPlaybackState()
@@ -2102,6 +2744,15 @@ final class PlayerViewModel {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
 
         loadArtwork(for: song)
+
+        // If an AirPlay output is already active when the song changes,
+        // push title/artist into the new AVPlayerItem's externalMetadata
+        // immediately so the receiver doesn't show a blank card while the
+        // artwork download is in flight. Artwork gets patched in later
+        // by `loadArtwork`.
+        if isAirPlayRouteActive() {
+            applyExternalMetadataForAirPlay()
+        }
     }
 
     private func updateNowPlayingPlaybackState() {
@@ -2134,6 +2785,16 @@ final class PlayerViewModel {
                     var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
                     info[MPMediaItemPropertyArtwork] = artwork
                     MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+
+                    // Cache the loaded image for the AirPlay route
+                    // handler. Only refresh externalMetadata when an
+                    // AirPlay output is currently active — otherwise we
+                    // leave the AVPlayerItem untouched.
+                    self.lastArtworkImage = image
+                    self.lastArtworkSongID = song.youtubeID
+                    if self.isAirPlayRouteActive() {
+                        self.applyExternalMetadataForAirPlay()
+                    }
                 }
             } catch {
                 // Artwork is non-essential; a failed download just means
@@ -2201,11 +2862,68 @@ final class PlayerViewModel {
             return .success
         }
 
-        // Lock screen shows Next / Previous, not ±15s skip. Disable
-        // skip commands so iOS renders the track-transport glyphs that
-        // wire to nextTrackCommand / previousTrackCommand above.
+        // ±30s skip — wired for CarPlay, lock screen, and Siri
+        // ("skip forward 30 seconds"). skipForward/skipBackward already
+        // clamp to [0, duration] so over/underflow is impossible.
         center.skipForwardCommand.removeTarget(nil)
+        center.skipForwardCommand.preferredIntervals = [30]
+        center.skipForwardCommand.addTarget { [weak self] event in
+            guard let self else { return .commandFailed }
+            let interval = (event as? MPSkipIntervalCommandEvent)?.interval ?? 30
+            Task { @MainActor in self.skipForward(seconds: interval) }
+            return .success
+        }
+
         center.skipBackwardCommand.removeTarget(nil)
+        center.skipBackwardCommand.preferredIntervals = [30]
+        center.skipBackwardCommand.addTarget { [weak self] event in
+            guard let self else { return .commandFailed }
+            let interval = (event as? MPSkipIntervalCommandEvent)?.interval ?? 30
+            Task { @MainActor in self.skipBackward(seconds: interval) }
+            return .success
+        }
+
+        // Shuffle / repeat — required for CarPlay's dedicated
+        // CPNowPlayingShuffleButton / CPNowPlayingRepeatButton to
+        // forward taps. The buttons' own handlers also call
+        // toggleShuffle / toggleRepeat directly, so these targets are
+        // belt-and-braces for head units that route through
+        // MPRemoteCommandCenter instead of the button closure.
+        center.changeShuffleModeCommand.removeTarget(nil)
+        center.changeShuffleModeCommand.addTarget { [weak self] event in
+            guard let self else { return .commandFailed }
+            let requested = (event as? MPChangeShuffleModeCommandEvent)?.shuffleType
+            Task { @MainActor in
+                let wantOn = (requested ?? (self.isShuffled ? .off : .items)) != .off
+                if wantOn != self.isShuffled { self.toggleShuffle() }
+            }
+            return .success
+        }
+
+        center.changeRepeatModeCommand.removeTarget(nil)
+        center.changeRepeatModeCommand.addTarget { [weak self] event in
+            guard let self else { return .commandFailed }
+            let requested = (event as? MPChangeRepeatModeCommandEvent)?.repeatType
+            Task { @MainActor in
+                let target: RepeatMode
+                if let requested {
+                    switch requested {
+                    case .off: target = .off
+                    case .one: target = .one
+                    case .all: target = .all
+                    @unknown default: target = .off
+                    }
+                } else {
+                    switch self.repeatMode {
+                    case .off: target = .all
+                    case .all: target = .one
+                    case .one: target = .off
+                    }
+                }
+                while self.repeatMode != target { self.toggleRepeat() }
+            }
+            return .success
+        }
 
         center.playCommand.isEnabled = true
         center.pauseCommand.isEnabled = true
@@ -2213,8 +2931,10 @@ final class PlayerViewModel {
         center.nextTrackCommand.isEnabled = true
         center.previousTrackCommand.isEnabled = true
         center.changePlaybackPositionCommand.isEnabled = true
-        center.skipForwardCommand.isEnabled = false
-        center.skipBackwardCommand.isEnabled = false
+        center.skipForwardCommand.isEnabled = true
+        center.skipBackwardCommand.isEnabled = true
+        center.changeShuffleModeCommand.isEnabled = true
+        center.changeRepeatModeCommand.isEnabled = true
     }
 
     // MARK: - Lyrics loading

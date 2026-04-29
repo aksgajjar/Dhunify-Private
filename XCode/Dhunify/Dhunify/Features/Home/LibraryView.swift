@@ -10,6 +10,9 @@
 //
 
 import SwiftUI
+import os
+
+private let libraryLog = Logger(subsystem: "com.diphoria.Dhunify", category: "Library")
 
 struct LibraryView: View {
     @Environment(AppContainer.self) private var container
@@ -42,6 +45,8 @@ struct LibraryView: View {
             }
             await viewModel?.loadLibrary()
             refreshDownloads()
+            let pm = PlaylistManager.shared
+            libraryLog.info("Loaded library: playlists=\(pm.currentPlaylists.count) songs=\(viewModel?.songs.count ?? 0) downloaded=\(downloadedSongs.count)")
         }
         .onAppear { refreshDownloads() }
     }
@@ -92,9 +97,6 @@ private struct LibraryContent: View {
         .animation(.spring(response: 0.28, dampingFraction: 0.78), value: viewModel.isLoading)
         .animation(.spring(response: 0.28, dampingFraction: 0.78), value: viewModel.filteredSongs)
         .animation(.spring(response: 0.28, dampingFraction: 0.78), value: viewModel.errorMessage)
-        .navigationDestination(for: UUID.self) { playlistID in
-            PlaylistDetailView(playlistID: playlistID)
-        }
     }
 
     // MARK: - Top bar
@@ -184,9 +186,9 @@ private struct LibraryContent: View {
 
     @ViewBuilder
     private var mainContent: some View {
-        if viewModel.isLoading && viewModel.songs.isEmpty && downloadedSongs.isEmpty {
+        if viewModel.isLoading && viewModel.songs.isEmpty && downloadedSongs.isEmpty && pm.currentPlaylists.isEmpty {
             loadingList
-        } else if viewModel.songs.isEmpty && downloadedSongs.isEmpty {
+        } else if viewModel.songs.isEmpty && downloadedSongs.isEmpty && pm.currentPlaylists.isEmpty {
             libraryEmptyState
         } else {
             libraryList
@@ -231,7 +233,10 @@ private struct LibraryContent: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 12) {
                             ForEach(pm.currentPlaylists) { playlist in
-                                NavigationLink(value: playlist.id) {
+                                Button {
+                                    libraryLog.info("Tapped playlist '\(playlist.name, privacy: .public)' id=\(playlist.id.uuidString, privacy: .public)")
+                                    router.path.append(playlist.id)
+                                } label: {
                                     VStack(spacing: 6) {
                                         Text(playlist.emoji)
                                             .font(.system(size: 28))
@@ -246,6 +251,7 @@ private struct LibraryContent: View {
                                             .foregroundStyle(.appSecondary)
                                     }
                                     .frame(width: 80)
+                                    .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
                             }

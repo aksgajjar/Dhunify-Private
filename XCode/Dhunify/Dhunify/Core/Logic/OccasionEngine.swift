@@ -123,18 +123,6 @@ struct OccasionEngine {
                     "falguni pathak garba",
                 ]
             )
-        // Eid (approximate)
-        case (4, 1...30), (5, 1...15):
-            return Occasion(
-                name: "Eid Mubarak",
-                queries: [
-                    "eid mubarak songs hindi",
-                    "bollywood eid songs",
-                    "atif aslam eid songs",
-                    "eid celebration music",
-                    "ramadan hindi songs",
-                ]
-            )
         // Christmas
         case (12, 22...26):
             return Occasion(

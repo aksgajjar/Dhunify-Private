@@ -158,6 +158,9 @@ struct ContentView: View {
                     .navigationDestination(for: AlbumResult.self) { album in
                         AlbumDetailView(album: album)
                     }
+                    .navigationDestination(for: UUID.self) { playlistID in
+                        PlaylistDetailView(playlistID: playlistID)
+                    }
                 }
                 .overlay {
                     if let route = router.playerRoute,
