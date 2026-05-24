@@ -1141,6 +1141,13 @@ final class CarPlayCoordinator: NSObject {
 
     private func play(queue: [Song], startIndex: Int, seed: String) {
         coordinatorLogger.info("🚗 Play tap — seed=\(seed, privacy: .public) idx=\(startIndex) count=\(queue.count)")
+        if seed == "Resume" {
+            let pos = LastPlayedPersistence.loadPosition()
+            if pos > 3 {
+                playerViewModel.pendingResumeSeconds = pos
+                coordinatorLogger.info("🚗 Continue → arm resume @ \(Int(pos))s")
+            }
+        }
         playerViewModel.setQueue(queue, startIndex: startIndex, categorySeed: seed)
         playerViewModel.play()
         pushNowPlaying()

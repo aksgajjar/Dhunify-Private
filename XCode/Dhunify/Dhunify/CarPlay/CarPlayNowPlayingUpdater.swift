@@ -79,7 +79,17 @@ final class CarPlayNowPlayingUpdater {
         }
 
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = playerViewModel.currentTime
-        info[MPMediaItemPropertyPlaybackDuration] = playerViewModel.duration
+        // Only write a finite > 0 duration. HLS items hydrate duration
+        // 1-3s after load — writing the stale 0 marks the scrub bar as
+        // non-interactive in CarPlay, and CarPlay can keep the disabled
+        // state even after duration arrives. Drop the key while invalid
+        // so the next observation tick (duration is in the tracked set)
+        // writes a fresh valid value and re-enables scrubbing.
+        if playerViewModel.duration > 0, playerViewModel.duration.isFinite {
+            info[MPMediaItemPropertyPlaybackDuration] = playerViewModel.duration
+        } else {
+            info[MPMediaItemPropertyPlaybackDuration] = nil
+        }
         info[MPNowPlayingInfoPropertyPlaybackRate] = playerViewModel.isPlaying ? 1.0 : 0.0
 
         // Inline re-assert. Protects against the case where our tick

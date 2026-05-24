@@ -99,6 +99,18 @@ final class PlayerViewModel {
 
     static let speedOptions: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5]
 
+    // EXPERIMENT (Test A): candidate User-Agents injected onto the
+    // AVURLAsset so mediaserverd's media requests don't go out as the
+    // default `AppleCoreMedia/...` UA the ANDROID_VR-signed googlevideo
+    // URL appears to refuse. Cycled per load (by load generation) so one
+    // session sweeps all three; each load logs which is active. Remove
+    // after the experiment concludes.
+    static let experimentUAs: [(label: String, ua: String)] = [
+        ("ANDROID_VR", "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"),
+        ("MobileSafari", "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"),
+        ("AndroidChrome", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"),
+    ]
+
     // MARK: - Playback infrastructure
 
     var playbackError: String? = nil
@@ -242,10 +254,20 @@ final class PlayerViewModel {
         self.queue = queue
         self.currentIndex = max(0, min(currentIndex, max(queue.count - 1, 0)))
 
-        // Mid-play stalls (cell handover, weak signal, dead zone): let
-        // AVPlayer auto-pause + refill + auto-resume on its own. Startup
-        // is still instant because every code path uses
-        // `playImmediately(atRate:)`, which bypasses this flag.
+        // Fast-start: hand AVPlayer the URL and play as soon as ANY
+        // bytes arrive. `automaticallyWaitsToMinimizeStalling=true`
+        // combined with a 30-60 s preferredForwardBufferDuration
+        // caused AVPlayer to sit in `WaitingToMinimizeStallsReason`
+        // for 5-15 s before READY on long progressive YT tracks.
+        // Reactive recovery (`.failed` → backend, 8 s watchdog, stall
+        // recovery via `resolveFresh`, network path-change re-resolve)
+        // remains in place, so mid-track stalls still recover.
+        // EXPERIMENT (long-progressive readiness): Safari plays the same
+        // long googlevideo URL after ~10-15s. Reverting to Apple-default
+        // wait behaviour to let long progressive items buffer enough to
+        // reach .readyToPlay naturally instead of fast-starting on an
+        // empty buffer. Revert to `false` if this regresses short-track
+        // startup latency.
         player.automaticallyWaitsToMinimizeStalling = true
         playerB.automaticallyWaitsToMinimizeStalling = true
         preloaderPlayer.automaticallyWaitsToMinimizeStalling = true
@@ -535,21 +557,26 @@ final class PlayerViewModel {
 
     // MARK: - Network adaptive playback
 
-    /// Picks the forward-buffer target based on current network. Cell
-    /// or constrained: 60 s so we ride out forest / tunnel dead zones.
-    /// WiFi: 30 s — still generous, but less RAM pressure when there's
-    /// no signal anxiety. Returned in seconds. AVPlayer treats this as
-    /// a cap on how far ahead it will fetch.
+    /// Forward-buffer target. 2 s — minimal, lets playback start fast
+    /// while AVPlayer keeps reading ahead on its own. The 30-60 s
+    /// network-adaptive cap that lived here was the root cause of the
+    /// `WaitingToMinimizeStallsReason` startup latency seen on long
+    /// progressive YT tracks. Reactive recovery handles mid-track
+    /// failures so the deep buffer was over-defensive.
     private var preferredForwardBufferDurationForCurrentNetwork: TimeInterval {
-        return (isOnCellular || isConstrainedNetwork) ? 60 : 30
+        // EXPERIMENT (long-progressive readiness): 0 = automatic, lets
+        // AVPlayer choose its own buffer depth (Safari-like). Was 2,
+        // which paired with autoWait=false to fast-start on a near-empty
+        // buffer. Revert to 2 if this regresses startup.
+        return 0
     }
 
-    /// Caps the HLS variant AVPlayer is allowed to pick. 64 kbps on
-    /// cellular keeps audio playing on weak signal; 0 (unlimited) on
-    /// WiFi lets AVPlayer choose freely. Has no effect on progressive
-    /// (non-HLS) streams — those just ignore it.
+    /// 0 = no cap. AVPlayer picks freely. The cellular 64 kbps cap
+    /// that lived here only affected HLS variants, never progressive
+    /// streams (which dominate this app's load), so it offered no
+    /// real protection while contributing to the slow-start tuning.
     private var preferredPeakBitRateForCurrentNetwork: Double {
-        return (isOnCellular || isConstrainedNetwork) ? 64_000 : 0
+        return 0
     }
 
     /// Starts the NWPathMonitor watcher. Updates `isOnCellular` /
@@ -605,17 +632,38 @@ final class PlayerViewModel {
 
     // MARK: - Loading
 
+    /// True iff `token` is still the active load generation AND `item`
+    /// is still the player's installed item. Every async player callback
+    /// guards on this so a superseded load or a swapped-out item can't
+    /// mutate shared player state.
+    private func loadStillCurrent(_ token: Int, _ item: AVPlayerItem) -> Bool {
+        token == loadToken && item === player.currentItem
+    }
+
     private func loadCurrentSong() {
-        guard Date().timeIntervalSince(lastLoadTime) > 0.8 else {
+        let loadTargetID = currentSong?.youtubeID
+        // Re-entrancy + cooldown apply only to the SAME song. A request
+        // for a DIFFERENT song must supersede the in-flight load —
+        // otherwise a load abandoned at the staleness guard or the
+        // unknown-hang watchdog (both bail when currentSong changed
+        // without clearing isLoadingItem) wedges the lock forever and
+        // every later load is rejected here.
+        if isLoadingItem, loadingSongID == loadTargetID {
+            Self.logger.info("⛔️ loadCurrentSong skipped — same song already loading")
+            return
+        }
+        if Date().timeIntervalSince(lastLoadTime) <= 0.8, loadingSongID == loadTargetID {
             Self.logger.info("⛔️ loadCurrentSong skipped — cooldown active")
             return
         }
-        guard !isLoadingItem else {
-            Self.logger.info("⛔️ loadCurrentSong skipped — load already in progress")
-            return
+        if isLoadingItem {
+            Self.logger.info("↻ superseding stale load (\(self.loadingSongID ?? "nil")) → \(loadTargetID ?? "nil")")
         }
         lastLoadTime = Date()
+        loadToken &+= 1
+        let loadGen = loadToken
         isLoadingItem = true
+        loadingSongID = loadTargetID
         // Stall-recovery state restarts with each new load.
         // `playbackStartedAt` gets set to the instant `.playing` first
         // fires; `lastRecoveryAt` is cleared so the 30s cooldown
@@ -623,13 +671,22 @@ final class PlayerViewModel {
         playbackStartedAt = nil
         lastRecoveryAt = nil
         cancelStallRecoveryCheck()
-        // IMMEDIATELY stop old audio — no gap.
-        player.pause()
-        player.volume = volume // reset from any crossfade
-        player.replaceCurrentItem(with: nil)
 
-        // Cancel any pending YT webm→mp4 fallback watchdog from a prior
-        // load so it can't fire against the new song.
+        // Tear down ALL observers + watchdogs BEFORE detaching the
+        // outgoing item. Detaching first (replaceCurrentItem(nil)) while
+        // the status observer or end-of-item notification are still live
+        // lets a teardown-time callback fire against the outgoing item
+        // and mutate shared player state — the stale-callback corruption.
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = nil
+        if let token = timeObserverToken {
+            player.removeTimeObserver(token)
+            timeObserverToken = nil
+        }
+        if let observer = endOfItemObserver {
+            NotificationCenter.default.removeObserver(observer)
+            endOfItemObserver = nil
+        }
         ytFallbackWatchdog?.cancel()
         ytFallbackWatchdog = nil
         pendingYTFallbackURL = nil
@@ -637,6 +694,11 @@ final class PlayerViewModel {
         backendFallbackUsed = false
         unknownStatusWatchdog?.cancel()
         unknownStatusWatchdog = nil
+
+        // Observers gone — now safe to stop + detach the outgoing item.
+        player.pause()
+        player.volume = volume // reset from any crossfade
+        player.replaceCurrentItem(with: nil)
 
         // Drop stale preload state if it was for a different song. Keep
         // it intact when the user advances to the preload target — the
@@ -649,25 +711,9 @@ final class PlayerViewModel {
             preloadedYTDuration = nil
         }
         // Evict preloaded items that are no longer in the [next, next+1]
-        // window after the index change. The matching slot (if any) for
-        // the new current song is consumed below, so it's allowed to
-        // survive this pass.
+        // window after the index change.
         evictStalePreloadedItems(keepSongID: targetID)
 
-        // Tear down previous item observers.
-        itemStatusObservation?.invalidate()
-        itemStatusObservation = nil
-        if let token = timeObserverToken {
-            player.removeTimeObserver(token)
-            timeObserverToken = nil
-        }
-        // Drop the old end-of-item observer so a stale notification
-        // from the previous item (e.g., fired during item teardown)
-        // can't trigger handlePlaybackEnded and race the new load.
-        if let observer = endOfItemObserver {
-            NotificationCenter.default.removeObserver(observer)
-            endOfItemObserver = nil
-        }
         playbackError = nil
 
         guard let song = currentSong else {
@@ -678,6 +724,7 @@ final class PlayerViewModel {
             dominantColor = .appSurface
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
             isLoadingItem = false
+            loadingSongID = nil
             return
         }
 
@@ -695,6 +742,7 @@ final class PlayerViewModel {
             isPlaying = false
             playbackError = "Could not build playback URL"
             isLoadingItem = false
+            loadingSongID = nil
             return
         }
 
@@ -808,6 +856,7 @@ final class PlayerViewModel {
                         Self.logger.error("🧪 DBG YT resolver FAILED domain=\(nse.domain) code=\(nse.code) desc=\(error.localizedDescription)")
                         playbackError = "Couldn't resolve this track. Try another."
                         isLoadingItem = false
+                        loadingSongID = nil
                         self.clearPlayFeedback(animated: false)
                         preloadedURL = nil
                         preloadedSongID = nil
@@ -834,54 +883,34 @@ final class PlayerViewModel {
                 preloadedURL = nil
                 preloadedSongID = nil
             }
-            // Stability guard: IP-bound googlevideo URLs carry an `ip=`
-            // query param that locks them to the device's current egress
-            // IP. The URL 403s the moment the IP shifts (Wi-Fi ↔ LTE
-            // hand-off, VPN toggle, captive portal switch), which is a
-            // real failure mode on tracks longer than ~15 minutes but a
-            // non-issue on short tracks. Short tracks keep the fast
-            // path. Long / unknown-duration tracks pay one extra round
-            // trip for a stable URL. On failure we keep the original —
-            // graceful degradation over hard stop.
-            // Stability: reject IP-bound URLs for ALL YouTube tracks,
-            // not just long ones. Any duration can stall when egress IP
-            // shifts mid-play. `resolveStable` loops every InnerTube
-            // client until a non-IP-bound URL lands (prefers HLS /
-            // manifest.googlevideo.com); throws if none available.
-            if song.isYouTubeSource,
-               Self.urlIsIPBound(finalURL) {
-                let guardDuration = self.ytStreamDuration > 0 ? self.ytStreamDuration : song.duration
-                Self.logger.info("⚠️ IP-bound URL detected dur=\(Int(guardDuration))s — attempting stable re-resolve")
-                do {
-                    let stable = try await YouTubeStreamResolver.shared.resolveStable(videoID: song.youtubeID, expectedDuration: guardDuration)
-                    finalURL = stable.url
-                    pendingYTFallbackURL = stable.fallbackURL
-                    if stable.duration > 0 { self.ytStreamDuration = stable.duration }
-                    Self.logger.info("✅ stable URL replaced host=\(stable.url.host ?? "?")")
-                } catch {
-                    Self.logger.info("⚠️ stable re-resolve failed: \(error.localizedDescription)")
-                }
-            }
 
-            // Hard block ONLY long IP-bound YT streams. Short tracks on
-            // IP-bound URLs play fine in the ~15-min window before the
-            // egress IP shifts; blocking them is over-protection that
-            // kills normal Bollywood tracks. Long tracks (>1200s) don't
-            // fit that window and stall mid-playback, so the re-resolve
-            // failure IS fatal there. HLS exempt: per-chunk signed.
-            let blockDuration = self.ytStreamDuration > 0 ? self.ytStreamDuration : song.duration
-            if song.isYouTubeSource,
-               !Self.urlIsHLS(finalURL),
-               Self.urlIsIPBound(finalURL),
-               blockDuration > 1200 {
-                Self.logger.error("❌ BLOCKED: long IP-bound stream dur=\(Int(blockDuration))s — not playable")
-                self.playbackError = "This long track is not playable. Try another version."
-                self.isLoadingItem = false
-                self.isPlaying = false
-                return
+            // Route YouTube playback through the local byte-range relay. The
+            // relay resolves a fresh itag-139/140 URL server-side and serves a
+            // range-correct, fully-stitched body, so AVPlayer never touches the
+            // IP-bound googlevideo URL directly. Skip file:// (L2 offline cache
+            // still plays locally). Relay URLs carry no `ip` param and aren't
+            // HLS, so the IP-bound stability guard, the reactive `.failed`
+            // re-resolve, and the stall watchdog below all self-disable.
+            if song.isYouTubeSource, !finalURL.isFileURL,
+               let relayURL = Self.relayStreamURL(youtubeID: song.youtubeID) {
+                Self.logger.info("🔀 Relay playback id=\(song.youtubeID, privacy: .public) → \(relayURL.absoluteString, privacy: .public)")
+                finalURL = relayURL
             }
-            if song.isYouTubeSource, Self.urlIsIPBound(finalURL), !Self.urlIsHLS(finalURL) {
-                Self.logger.info("⚠️ IP-bound URL allowed (dur=\(Int(blockDuration))s ≤ 1200s) — playing with fallback")
+            // Direct-play philosophy: hand the resolved URL to AVPlayer
+            // without preemptive validation. IP-bound googlevideo URLs
+            // play fine on stable networks; the failure mode (egress IP
+            // shift mid-track → 403) is rare and handled reactively by
+            // the `.failed` branch (swap to backend) and the 8s
+            // unknown-status watchdog. Pre-rejecting all IP-bound URLs
+            // wasted 600-1200 ms per load and over-blocked playable
+            // long tracks. HLS still preferred when the resolver
+            // returns it (see YouTubeStreamResolver hlsManifestUrl
+            // branch); this is just the no-pre-validation fall-through.
+            if song.isYouTubeSource,
+               Self.urlIsIPBound(finalURL),
+               !Self.urlIsHLS(finalURL) {
+                let ipDuration = self.ytStreamDuration > 0 ? self.ytStreamDuration : song.duration
+                Self.logger.info("⚠️ IP-bound URL accepted dur=\(Int(ipDuration))s — playing directly, reactive recovery on .failed")
             }
 
             Self.logger.info("🎵 [3/5] Final URL: \(finalURL.host ?? "?") (\(finalURL.absoluteString.count) chars)")
@@ -894,8 +923,13 @@ final class PlayerViewModel {
             // Resolver can take a beat on first play; if the user skipped
             // to another track while we were resolving, drop this result
             // so we don't race a newer loadCurrentSong's item install.
-            guard self.currentSong?.youtubeID == song.youtubeID else {
-                Self.logger.info("🎵 Song changed during resolve — aborting install for \(song.youtubeID)")
+            // Single-flight install: only the LATEST load may mutate player
+            // state. A newer loadCurrentSong bumps `loadToken`, so any stale
+            // resolve (even for the same song) aborts here instead of racing
+            // an AVPlayerItem install onto the active relay playback.
+            guard self.currentSong?.youtubeID == song.youtubeID,
+                  loadGen == self.loadToken else {
+                Self.logger.info("🎵 Stale load — aborting install for \(song.youtubeID) (gen=\(loadGen) cur=\(self.loadToken))")
                 return
             }
 
@@ -968,16 +1002,37 @@ final class PlayerViewModel {
             // buffer state persists across this move — that's what
             // produces the near-instant transition for long tracks.
             //
-            // Safety: if the preloaded item reached .failed while
-            // buffering (bad network, expired URL, 403), drop it and
-            // fall through to a fresh `AVPlayerItem(url:)` build.
-            // iOS 26 forbids an AVPlayerItem from being attached to more
-            // than one AVPlayer instance. Always build a fresh item
-            // from the resolved URL — drop any preload slot so the
-            // warmer player is cleared, but never hand its item back.
-            _ = self.takePreloadedItem(songID: song.youtubeID, allowFailed: false)
+            // Gapless preload: reuse the pre-buffered AVPlayerItem when
+            // one was warmed for this song. `takePreloadedItem` detaches
+            // the warmer player first (line ~2017) so the item moves
+            // cleanly to the main player; its buffer state survives the
+            // move and produces a near-instant transition into
+            // .readyToPlay for long tracks. Safety: if the preload
+            // reached .failed during buffering, drop the slot and fall
+            // through to a fresh build.
+            // Always build a FRESH AVPlayerItem per install. Reusing a
+            // pre-warmed item that was associated with `preloaderPlayer`
+            // is unsafe on iOS 26 and a source of stale-state bugs; the
+            // small gapless win isn't worth the lifecycle risk. Consume
+            // (and discard) any warmed slot for this song so it detaches
+            // from the warmer and can't be reused elsewhere.
             _ = self.takePreloadedItem(songID: song.youtubeID, allowFailed: true)
-            let item = AVPlayerItem(url: playURL)
+            let item: AVPlayerItem
+            if song.isYouTubeSource, !playURL.isFileURL {
+                // EXPERIMENT (Test A): override the media-request UA via
+                // AVURLAssetHTTPHeaderFieldsKey, cycling candidates per
+                // load so one session tests all. Does mediaserverd start
+                // consuming bytes with a non-AppleCoreMedia UA?
+                let pick = Self.experimentUAs[loadGen % Self.experimentUAs.count]
+                let asset = AVURLAsset(
+                    url: playURL,
+                    options: ["AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": pick.ua]]
+                )
+                item = AVPlayerItem(asset: asset)
+                Self.logger.info("🧪 UA-EXPERIMENT gen=\(loadGen) client=\(pick.label)")
+            } else {
+                item = AVPlayerItem(url: playURL)
+            }
             // Adaptive forward buffer: 60 s on cellular / constrained
             // networks (forest, tunnels), 30 s on WiFi. Combined with
             // `automaticallyWaitsToMinimizeStalling=true` this lets
@@ -995,6 +1050,15 @@ final class PlayerViewModel {
             itemStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] playerItem, _ in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
+                    // Identity + generation guard: ignore a status
+                    // callback from a load that was superseded, or from
+                    // an item no longer installed on the player. Without
+                    // this a stale item's late .readyToPlay/.failed
+                    // mutates the current item's state.
+                    guard self.loadStillCurrent(loadGen, playerItem) else {
+                        Self.logger.info("⏭️ stale status callback ignored (gen=\(loadGen))")
+                        return
+                    }
                     switch playerItem.status {
                     case .readyToPlay:
                         let dur = playerItem.duration.seconds
@@ -1008,6 +1072,7 @@ final class PlayerViewModel {
                         }
                         self.isBuffering = false
                         self.isLoadingItem = false
+                        self.loadingSongID = nil
                         // Auto-play when ready. playImmediately skips
                         // AVPlayer's buffer-fill heuristic — starts
                         // now even if only a small buffer is present.
@@ -1106,6 +1171,7 @@ final class PlayerViewModel {
                         self.isBuffering = false
                         self.isPlaying = false
                         self.isLoadingItem = false
+                        self.loadingSongID = nil
                         self.clearPlayFeedback(animated: false)
                     case .unknown:
                         Self.logger.info("🎵 Status: unknown (buffering...)")
@@ -1115,20 +1181,28 @@ final class PlayerViewModel {
                 }
             }
 
-            // Apply EQ audio mix if configured.
-            if let mix = await EQManager.shared.createAudioMix(for: item) {
-                item.audioMix = mix
-            }
-
-            // Set the item on the player. Always detach preloaderPlayer
-            // first — iOS 26 rejects an AVPlayerItem that is still
-            // associated with another AVPlayer, and the `===` guard
-            // isn't reliable across all preload paths.
+            // Install the item synchronously so AVPlayer can start
+            // loading the asset (moov, first chunks) in parallel with
+            // EQ mix setup. `EQManager.createAudioMix` awaits
+            // `asset.loadTracks`; awaiting it BEFORE replaceCurrentItem
+            // blocks playback start on long progressive items because
+            // loadTracks must fetch + parse the full moov atom before
+            // returning. Detach the warmer first — iOS 26 rejects an
+            // AVPlayerItem still associated with another AVPlayer.
             preloaderPlayer.replaceCurrentItem(with: nil)
             player.replaceCurrentItem(with: item)
             player.volume = volume
             observeEndOfItem(item)
             installTimeObserver()
+
+            // EQ audio mix is best-effort and applied after install so
+            // it never gates AVPlayer's status transitions.
+            Task { @MainActor [weak self] in
+                guard self != nil else { return }
+                if let mix = await EQManager.shared.createAudioMix(for: item) {
+                    item.audioMix = mix
+                }
+            }
 
             // L2 disk cache writeback. Background-download the same
             // URL into `Caches/audio/` so the next replay of this
@@ -1158,37 +1232,67 @@ final class PlayerViewModel {
             // per load, gated by `backendFallbackUsed`.
             unknownStatusWatchdog?.cancel()
             if song.isYouTubeSource {
+                let watchdogItem = item
                 unknownStatusWatchdog = Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: 8_000_000_000)
+                    // EXPERIMENT: 30s (was 8s). Safari needs ~10-15s to
+                    // ready a long progressive moov; 8s guillotined valid
+                    // loads before readiness. Revert to 8s after the test.
+                    try? await Task.sleep(nanoseconds: 30_000_000_000)
                     if Task.isCancelled { return }
                     await MainActor.run {
                         guard let self else { return }
-                        guard self.currentSong?.youtubeID == song.youtubeID else { return }
+                        // Keyed to THIS load's item identity + generation,
+                        // not just the song — a superseded load's watchdog
+                        // can't fire a backend swap on the new item.
+                        guard self.loadStillCurrent(loadGen, watchdogItem) else { return }
                         guard self.wantsToPlay, !self.backendFallbackUsed else { return }
-                        guard let current = self.player.currentItem,
-                              current.status != .readyToPlay,
-                              current.status != .failed else { return }
+                        guard watchdogItem.status != .readyToPlay,
+                              watchdogItem.status != .failed else { return }
                         Self.logger.info("⏰ unknown-hang watchdog → backend fallback for \(song.youtubeID)")
                         self.swapToBackendYTStream(song: song, resumeAt: self.currentTime)
                     }
                 }
             }
 
-            // Kick playback immediately instead of waiting for the
-            // KVO readyToPlay callback. Setting `player.rate` before
-            // the item is ready is safe — AVPlayer latches the rate
-            // and starts producing audio as soon as the first samples
-            // arrive (automaticallyWaitsToMinimizeStalling=false above
-            // keeps it from over-buffering first). Typically shaves
-            // 1-3s off perceived startup latency. The KVO observer
-            // still fires readyToPlay to clear isBuffering and is
-            // idempotent w.r.t. the rate set here.
-            if wantsToPlay {
-                player.rate = playbackSpeed
-                Self.logger.info("🎵 Eager play dispatched (status=\(item.status.rawValue))")
-            }
+            // No eager play. Starting `player.rate` before the item is
+            // `.readyToPlay` produces the PLAYING→WAITING(NoItemToPlay)
+            // churn and races the deferred-start path. Playback is now
+            // driven solely by the `.readyToPlay` KVO above
+            // (`playImmediately`), which still starts the instant the
+            // item is ready. `wantsToPlay` carries the intent.
+            Self.logger.info("🎵 Item installed (gen=\(loadGen), deferred start, wantsToPlay: \(self.wantsToPlay))")
 
-            Self.logger.info("🎵 Item installed — rate: \(self.player.rate), wantsToPlay: \(self.wantsToPlay)")
+            // EXPERIMENT: readiness telemetry. Polls the installed item
+            // once/sec for up to 30s, logging buffer growth + status +
+            // exact time-to-readyToPlay. Generation/identity guarded and
+            // self-terminating on ready/failed/supersede. Remove after
+            // the long-progressive readiness experiment concludes.
+            let probeItem = item
+            let probeStart = Date()
+            Task { [weak self] in
+                for _ in 0..<30 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    let stop = await MainActor.run { () -> Bool in
+                        guard let self else { return true }
+                        guard self.loadStillCurrent(loadGen, probeItem) else { return true }
+                        let elapsed = Date().timeIntervalSince(probeStart)
+                        let buffered = probeItem.loadedTimeRanges
+                            .map { CMTimeGetSeconds($0.timeRangeValue.duration) }
+                            .reduce(0, +)
+                        Self.logger.info("🧪 RDY t=\(String(format: "%.1f", elapsed))s status=\(probeItem.status.rawValue) buffered=\(String(format: "%.1f", buffered))s empty=\(probeItem.isPlaybackBufferEmpty) likely=\(probeItem.isPlaybackLikelyToKeepUp) full=\(probeItem.isPlaybackBufferFull)")
+                        if probeItem.status == .readyToPlay {
+                            Self.logger.info("🧪 RDY ✅ time-to-readyToPlay=\(String(format: "%.1f", elapsed))s")
+                            return true
+                        }
+                        if probeItem.status == .failed {
+                            Self.logger.info("🧪 RDY ❌ failed at \(String(format: "%.1f", elapsed))s err=\(probeItem.error?.localizedDescription ?? "nil")")
+                            return true
+                        }
+                        return false
+                    }
+                    if stop { break }
+                }
+            }
 
             // Async diagnostic probe. Runs AFTER the AVPlayer hand-off
             // so it never blocks playback start. Skipped for tracks
@@ -1322,6 +1426,10 @@ final class PlayerViewModel {
     private func performStallRecovery(for song: Song, resumeAt: TimeInterval) {
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Capture the load generation at entry. The re-resolve below
+            // awaits; a skip/new load during that window must drop this
+            // recovery so it can't install a stale item or mutate state.
+            let loadGen = self.loadToken
             let fresh: YouTubeStream
             do {
                 // Use resolveStable — walks the client chain and rejects
@@ -1337,8 +1445,11 @@ final class PlayerViewModel {
                 )
                 return
             }
-            // User skipped during the re-resolve window → drop result.
-            guard self.currentSong?.youtubeID == song.youtubeID else { return }
+            // Superseded during the re-resolve window (skip / new load)
+            // → drop result. The generation guard closes the TOCTOU
+            // between this check and the synchronous install below.
+            guard loadGen == self.loadToken,
+                  self.currentSong?.youtubeID == song.youtubeID else { return }
             // Defensive: resolveStable rejects IP-bound URLs internally.
             // If one slipped through, abort recovery — replacing would
             // reproduce the exact failure mode we're recovering from.
@@ -1362,13 +1473,13 @@ final class PlayerViewModel {
             let item = AVPlayerItem(url: fresh.url)
             item.preferredForwardBufferDuration = preferredForwardBufferDurationForCurrentNetwork
             item.preferredPeakBitRate = preferredPeakBitRateForCurrentNetwork
-            if let mix = await EQManager.shared.createAudioMix(for: item) {
-                item.audioMix = mix
-            }
 
             self.itemStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] pi, _ in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
+                    // Identity + generation guard — a superseded recovery
+                    // item's late callback cannot mutate the current load.
+                    guard self.loadStillCurrent(loadGen, pi) else { return }
                     switch pi.status {
                     case .readyToPlay:
                         self.isBuffering = false
@@ -1406,11 +1517,18 @@ final class PlayerViewModel {
                 }
             }
 
+            // Install synchronously (no await between the supersede guard
+            // above and this install → TOCTOU closed), then apply EQ. No
+            // eager rate: playback starts only from the .readyToPlay
+            // branch above, matching the main/backend/fallback paths.
             self.player.replaceCurrentItem(with: item)
             self.observeEndOfItem(item)
             self.installTimeObserver()
-            if self.wantsToPlay {
-                self.player.rate = self.playbackSpeed
+            Task { @MainActor [weak self] in
+                guard self != nil else { return }
+                if let mix = await EQManager.shared.createAudioMix(for: item) {
+                    item.audioMix = mix
+                }
             }
         }
     }
@@ -1426,7 +1544,15 @@ final class PlayerViewModel {
     /// stream / redirect to a fresh, IP-stable audio URL on demand.
     /// One-shot per load via `backendFallbackUsed`.
     private func swapToBackendYTStream(song: Song, resumeAt: TimeInterval) {
+        // Relay mode: never swap to the backend yt-dlp stream. The relay is the
+        // single source of truth and re-resolves itself; a swap here would
+        // replace the live relay item and hijack player state.
+        if Self.relayPlaybackMode {
+            Self.logger.info("⛔️ backend yt-dlp fallback suppressed (relay mode)")
+            return
+        }
         backendFallbackUsed = true
+        let loadGen = loadToken
         unknownStatusWatchdog?.cancel()
         unknownStatusWatchdog = nil
         itemStatusObservation?.invalidate()
@@ -1464,6 +1590,10 @@ final class PlayerViewModel {
         itemStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] playerItem, _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                guard self.loadStillCurrent(loadGen, playerItem) else {
+                    Self.logger.info("⏭️ stale backend status callback ignored (gen=\(loadGen))")
+                    return
+                }
                 switch playerItem.status {
                 case .readyToPlay:
                     let dur = playerItem.duration.seconds
@@ -1509,17 +1639,56 @@ final class PlayerViewModel {
                 }
             }
         }
+        // Install the item synchronously so AVPlayer starts driving
+        // status transitions (.unknown → .readyToPlay/.failed) and the
+        // KVO observer above can clear isLoadingItem. EQ mix is
+        // best-effort and applied after attach; awaiting it here can
+        // stall on `asset.loadTracks` for backend URLs (302 redirect +
+        // fragmented MP4 parse), leaving the player wedged in
+        // .unknown forever.
+        self.player.replaceCurrentItem(with: item)
+        self.observeEndOfItem(item)
+        // Backend's own unknown-hang watchdog. The backend stream can
+        // also stall in .unknown (CDN 403 / proxy timeout). Since this
+        // is the last-resort source, surface an error + clear the load
+        // lock instead of hanging forever — nothing left to fall to.
+        let backendItem = item
+        unknownStatusWatchdog?.cancel()
+        unknownStatusWatchdog = Task { [weak self] in
+            // EXPERIMENT: 30s (was 8s) — match the main-load watchdog so
+            // the backend leg also gets a realistic readiness window.
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            if Task.isCancelled { return }
+            await MainActor.run {
+                guard let self else { return }
+                guard self.loadStillCurrent(loadGen, backendItem) else { return }
+                guard backendItem.status != .readyToPlay,
+                      backendItem.status != .failed else { return }
+                Self.logger.error("⏰ backend-fallback unknown-hang — surfacing error")
+                self.playbackError = "This track is unavailable right now"
+                self.isBuffering = false
+                self.isPlaying = false
+                self.isLoadingItem = false
+                self.loadingSongID = nil
+            }
+        }
         Task { @MainActor in
             if let mix = await EQManager.shared.createAudioMix(for: item) {
                 item.audioMix = mix
             }
-            self.player.replaceCurrentItem(with: item)
-            self.observeEndOfItem(item)
         }
     }
 
     private func swapToYTFallback(url: URL, song: Song) {
+        // Relay mode: never swap to the webm→mp4 fallback URL. The relay always
+        // serves itag-139/140 m4a; a swap here would replace the live relay
+        // item with a googlevideo URL and hijack player state.
+        if Self.relayPlaybackMode {
+            Self.logger.info("⛔️ webm→mp4 fallback suppressed (relay mode)")
+            return
+        }
         ytFallbackUsed = true
+        let loadGen = loadToken
         pendingYTFallbackURL = nil
         ytFallbackWatchdog?.cancel()
         ytFallbackWatchdog = nil
@@ -1532,6 +1701,10 @@ final class PlayerViewModel {
         itemStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] playerItem, _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                guard self.loadStillCurrent(loadGen, playerItem) else {
+                    Self.logger.info("⏭️ stale fallback status callback ignored (gen=\(loadGen))")
+                    return
+                }
                 switch playerItem.status {
                 case .readyToPlay:
                     let dur = playerItem.duration.seconds
@@ -1539,6 +1712,7 @@ final class PlayerViewModel {
                     if dur.isFinite, dur > 0 { self.duration = dur }
                     self.isBuffering = false
                     self.isLoadingItem = false
+                    self.loadingSongID = nil
                     if self.wantsToPlay {
                         self.player.playImmediately(atRate: self.playbackSpeed)
                         self.isPlaying = true
@@ -1572,6 +1746,7 @@ final class PlayerViewModel {
                     self.isBuffering = false
                     self.isPlaying = false
                     self.isLoadingItem = false
+                    self.loadingSongID = nil
                 case .unknown:
                     break
                 @unknown default:
@@ -1579,12 +1754,18 @@ final class PlayerViewModel {
                 }
             }
         }
-        Task { @MainActor in
+        // Install synchronously so AVPlayer starts driving status
+        // transitions and the item becomes `player.currentItem` (the
+        // identity the KVO guard checks). Awaiting EQ's `asset.loadTracks`
+        // before install can wedge the item in .unknown forever. EQ is
+        // best-effort and applied after attach.
+        self.player.replaceCurrentItem(with: item)
+        self.observeEndOfItem(item)
+        Task { @MainActor [weak self] in
+            guard self != nil else { return }
             if let mix = await EQManager.shared.createAudioMix(for: item) {
                 item.audioMix = mix
             }
-            self.player.replaceCurrentItem(with: item)
-            self.observeEndOfItem(item)
         }
     }
 
@@ -1644,6 +1825,18 @@ final class PlayerViewModel {
     /// and racing AVPlayerItem installs. All load entry points use
     /// this same guard; every early-exit and completion path resets it.
     private var isLoadingItem = false
+    /// youtubeID of the song the in-flight load is resolving. Lets the
+    /// `isLoadingItem` lock distinguish a same-song duplicate (skip)
+    /// from a different-song request (supersede). Cleared on every
+    /// terminal load path.
+    private var loadingSongID: String?
+    /// Monotonic load generation, bumped at the start of every
+    /// `loadCurrentSong`. Async callbacks (status KVO, watchdogs, seek
+    /// completions) capture the value live at dispatch and must re-check
+    /// it — together with item identity — before mutating shared player
+    /// state. A superseded load's late callback bails instead of
+    /// corrupting the current item (root of the PLAYING→WAITING wedge).
+    private var loadToken: Int = 0
 
     /// Rate-limits rapid `loadCurrentSong` calls (spam Next, mood tap,
     /// preload overlap). A 0.8s cooldown coalesces bursts into a single
@@ -1800,6 +1993,9 @@ final class PlayerViewModel {
     }
 
     private func preloadNextSong() {
+        // Relay mode: no preload. The relay serves a complete body per request;
+        // a parallel preload resolver chain only races the main load.
+        if Self.relayPlaybackMode { return }
         // Don't kick off preload work while the main player is mid-load.
         // Two resolver chains in flight fight each other on the network
         // and can race AVPlayerItem installs. Caller re-fires the 30%
@@ -2126,6 +2322,33 @@ final class PlayerViewModel {
     /// True if the URL carries an `ip=` query param — googlevideo's
     /// way of locking a signed URL to a specific client IP. Such URLs
     /// 403 when the device's egress IP changes.
+    /// Relay base for YouTube playback. AVPlayer streams every YouTube track
+    /// through the local byte-range relay (`/stream?id=<videoID>`) instead of
+    /// a direct googlevideo URL: the relay resolves a fresh itag-139/140 URL
+    /// server-side, stitches bounded subranges into a complete body, and
+    /// re-resolves transparently on URL expiry — sidestepping AppleCoreMedia's
+    /// direct-googlevideo incompatibility.
+    static let relayStreamBase = "http://192.168.1.76:8081"
+
+    /// While the relay owns resolution + transparent re-resolution server-side,
+    /// the app's reactive client recovery (next-track preload, webm→mp4
+    /// fallback, backend yt-dlp swap) is disabled: each would replace the relay
+    /// AVPlayerItem with a non-relay URL and race the single intended load,
+    /// which is exactly the install-hijack we're eliminating.
+    static let relayPlaybackMode = true
+
+    /// Build the relay playback URL for a YouTube videoID. `song.youtubeID`
+    /// carries a `yt_` prefix; the relay expects the bare 11-char ID, so strip
+    /// it (matching the resolver's own normalization). The ID is URL-safe by
+    /// construction; URLComponents percent-encodes defensively.
+    static func relayStreamURL(youtubeID rawID: String) -> URL? {
+        let id = rawID.hasPrefix("yt_") ? String(rawID.dropFirst(3)) : rawID
+        var components = URLComponents(string: relayStreamBase)
+        components?.path = "/stream"
+        components?.queryItems = [URLQueryItem(name: "id", value: id)]
+        return components?.url
+    }
+
     static func urlIsIPBound(_ url: URL) -> Bool {
         URLComponents(url: url, resolvingAgainstBaseURL: false)?
             .queryItems?
@@ -2345,6 +2568,7 @@ final class PlayerViewModel {
         queue = []
         currentIndex = 0
         isLoadingItem = false
+        loadingSongID = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 
@@ -2355,6 +2579,7 @@ final class PlayerViewModel {
     /// Spotify / Apple Music.
     func resetForCarPlayDisconnect() {
         isLoadingItem = false
+        loadingSongID = nil
     }
 
     func seek(to progress: Double) {
@@ -2437,11 +2662,16 @@ final class PlayerViewModel {
         LastPlayedPersistence.saveQueue(queue, currentIndex: currentIndex)
     }
 
-    /// Posts `.dhunifyQueueNearEnd` when ≤2 songs remain after the
-    /// current one so observers (CarPlay) can silently refill the queue.
+    /// Posts `.dhunifyQueueNearEnd` when ≤5 songs remain after the
+    /// current one so observers (iPhone QueueRefillCoordinator + CarPlay)
+    /// can silently top up the queue with similar tracks. Threshold is
+    /// generous on purpose — `SimilarTrackProvider` is single-flight per
+    /// anchor, so multiple near-end fires for the same song collapse to
+    /// one fetch, and the bigger window absorbs rapid skipping without
+    /// stranding the user at the tail.
     private func maybeSignalQueueNearEnd() {
         let remaining = queue.count - 1 - currentIndex
-        guard remaining >= 0, remaining <= 2 else { return }
+        guard remaining >= 0, remaining <= 5 else { return }
         NotificationCenter.default.post(name: .dhunifyQueueNearEnd, object: self)
     }
 
@@ -2679,19 +2909,57 @@ final class PlayerViewModel {
 
                 self.playerB.replaceCurrentItem(with: nil)
 
+                // The hand-off is a track change → new load generation, so
+                // a later loadCurrentSong supersedes it and the status
+                // observer below is gated like every other install path.
+                self.loadToken &+= 1
+                let loadGen = self.loadToken
+
+                // Tear down the outgoing item's status observer BEFORE
+                // detaching it (no stale callback during teardown).
+                self.itemStatusObservation?.invalidate()
+                self.itemStatusObservation = nil
+
                 let freshItem = AVPlayerItem(url: incomingURL)
                 freshItem.preferredForwardBufferDuration = freshBuffer
                 freshItem.audioMix = freshMix
 
+                let resumeTime = incomingTime
+                self.isBuffering = true
+                // Deferred playback: no rate-before-ready. The fresh item
+                // is cold (does not inherit playerB's buffer), so start
+                // only from .readyToPlay — accepts a small gap for a
+                // correct, wedge-free swap. Guarded by generation+identity.
+                self.itemStatusObservation = freshItem.observe(\.status, options: [.new, .initial]) { [weak self] pi, _ in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        guard self.loadStillCurrent(loadGen, pi) else { return }
+                        switch pi.status {
+                        case .readyToPlay:
+                            self.isBuffering = false
+                            let d = pi.duration.seconds
+                            if d.isFinite, d > 0 { self.duration = d }
+                            if resumeTime.isValid, resumeTime.seconds > 0 {
+                                self.player.seek(to: resumeTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in }
+                            }
+                            if self.wantsToPlay {
+                                self.player.playImmediately(atRate: self.playbackSpeed)
+                                self.isPlaying = true
+                                self.updateNowPlayingPlaybackState()
+                            }
+                        case .failed:
+                            Self.logger.error("⚠️ crossfade item failed: \(pi.error?.localizedDescription ?? "unknown")")
+                            self.isBuffering = false
+                            self.isPlaying = false
+                        default:
+                            break
+                        }
+                    }
+                }
+
                 self.player.replaceCurrentItem(with: freshItem)
                 self.player.volume = v
-                self.player.seek(to: incomingTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in }
-                self.player.rate = self.playbackSpeed
                 self.observeEndOfItem(freshItem)
-
-                // Refresh duration for the new item so UI + progress work.
-                let d = freshItem.duration.seconds
-                if d.isFinite, d > 0 { self.duration = d }
             } else {
                 self.playerB.replaceCurrentItem(with: nil)
             }

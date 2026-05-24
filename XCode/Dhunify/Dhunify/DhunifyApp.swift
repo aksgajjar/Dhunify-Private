@@ -42,6 +42,10 @@ final class DhunifyAppDelegate: NSObject, UIApplicationDelegate {
         MainActor.assumeIsolated {
             _ = AppContainer.shared.playerViewModel
             AppContainer.shared.startCarPlayUpdater()
+            // Touch the iPhone refill coordinator so it subscribes to
+            // `.dhunifyQueueNearEnd` before the user can reach the queue
+            // tail. Idempotent — lazy var ensures one observer.
+            _ = AppContainer.shared.queueRefillCoordinator
         }
 
         // Phase 3: prime the YouTube resolver in the background so the
@@ -123,6 +127,17 @@ struct DhunifyApp: App {
         let vm = AppContainer.shared.playerViewModel
         // Only restore if nothing is already playing.
         guard vm.currentSong == nil else { return }
-        vm.restoreQueue([song], startIndex: 0)
+        if let saved = LastPlayedPersistence.loadQueueIfFresh() {
+            vm.restoreQueue(saved.queue, startIndex: saved.index)
+        } else {
+            vm.restoreQueue([song], startIndex: 0)
+        }
+        // Arm resume so first play() — whether from UI tap or CarPlay
+        // route activation firing MPRemoteCommandCenter.playCommand —
+        // seeks to last saved position instead of restarting at 0.
+        let pos = LastPlayedPersistence.loadPosition()
+        if pos > 3 {
+            vm.pendingResumeSeconds = pos
+        }
     }
 }

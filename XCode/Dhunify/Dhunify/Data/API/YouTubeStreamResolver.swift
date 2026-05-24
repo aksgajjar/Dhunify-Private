@@ -107,6 +107,35 @@ final class YouTubeStreamResolver {
         ),
     ]
 
+    /// Long-track chain (>1200s). Prioritizes clients that return
+    /// `hlsManifestUrl` — HLS segments are per-chunk signed, so the
+    /// IP-bound failure that kills progressive MP4 on 20+ min tracks
+    /// doesn't apply. Sticky reorder is intentionally skipped. Restored
+    /// from c855ac1 (HLS_LONG_TRACK_STABLE_V1) after the CarPlay pass
+    /// dropped IOS_MUSIC and regressed long-track startup to progressive
+    /// IP-bound itag=139.
+    ///   1. IOS_MUSIC — YouTube Music iOS app; HLS for music content.
+    ///   2. TVHTML5_SIMPLY_EMBEDDED_PLAYER — embedded player; needs
+    ///      thirdParty.embedUrl.
+    ///   3. IOS (v20) — backs up the music client for non-music content.
+    ///   4. ANDROID_VR — last resort; IP-bound progressive.
+    private var longTrackChain: [(name: String, version: String, userAgent: String)] {
+        [
+            (
+                "IOS_MUSIC",
+                "7.11.2",
+                "com.google.ios.youtubemusic/7.11.2 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X)"
+            ),
+            (
+                "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                "2.0",
+                "Mozilla/5.0 (PlayStation; PlayStation 4/12.02) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
+            ),
+            clientChain[0],  // IOS (v20)
+            clientChain[1],  // ANDROID_VR
+        ]
+    }
+
     /// Name of the client whose last resolve succeeded. Next resolve
     /// tries this client first so repeated plays avoid wasting a round
     /// trip on the client that previously lost. Process-lifetime only —
@@ -386,8 +415,8 @@ final class YouTubeStreamResolver {
     /// path on the next long track without this skip.
     private func orderedChain(forLongTrack: Bool = false) -> [(name: String, version: String, userAgent: String)] {
         if forLongTrack {
-            logger.info("🧪 DBG long-track chain order: \(self.clientChain.map(\.name).joined(separator: " → "), privacy: .public)")
-            return clientChain
+            logger.info("🧪 DBG long-track chain order: \(self.longTrackChain.map(\.name).joined(separator: " → "), privacy: .public)")
+            return longTrackChain
         }
         lastClientLock.lock()
         let cached = lastSuccessfulClient
@@ -500,11 +529,27 @@ final class YouTubeStreamResolver {
             clientCtx["osName"] = "iOS"
             clientCtx["osVersion"] = "18.3.1.22D72"
             clientCtx["platform"] = "MOBILE"
+        case "IOS_MUSIC":
+            clientCtx["deviceMake"] = "Apple"
+            clientCtx["deviceModel"] = "iPhone16,2"
+            clientCtx["osName"] = "iOS"
+            clientCtx["osVersion"] = "18.3.1.22D72"
+            clientCtx["platform"] = "MOBILE"
+        case "TVHTML5_SIMPLY_EMBEDDED_PLAYER":
+            clientCtx["clientScreen"] = "EMBED"
+            clientCtx["platform"] = "TV"
         default:
             break
         }
 
-        let contextObj: [String: Any] = ["client": clientCtx]
+        // Build `context` as mutable dict so TVHTML5_SIMPLY_EMBEDDED_
+        // PLAYER can add the top-level `thirdParty.embedUrl` required
+        // to bypass the bot-wall. All other clients get the minimal
+        // `{client: ...}` shape unchanged.
+        var contextObj: [String: Any] = ["client": clientCtx]
+        if client.name == "TVHTML5_SIMPLY_EMBEDDED_PLAYER" {
+            contextObj["thirdParty"] = ["embedUrl": "https://www.youtube.com"]
+        }
 
         let body: [String: Any] = [
             "videoId": id,
@@ -593,6 +638,10 @@ final class YouTubeStreamResolver {
         // ANDROID_VR responses typically lack hlsManifestUrl, so
         // this branch is effectively IOS-only — which is exactly
         // the client we want for stability on long content.
+        if duration > 1200 {
+            let hasHLS = streamingData["hlsManifestUrl"] != nil
+            logger.info("🧪 DBG HLS-check client=\(client.name, privacy: .public) duration=\(Int(duration))s hlsManifestUrl=\(hasHLS ? "PRESENT" : "ABSENT", privacy: .public)")
+        }
         if duration > 1200,
            let hlsStr = streamingData["hlsManifestUrl"] as? String,
            let hlsURL = URL(string: hlsStr) {
@@ -616,6 +665,7 @@ final class YouTubeStreamResolver {
         // excluded entirely because the webm→mp4 3s watchdog cost
         // exceeds any bitrate win for long content.
         if duration > 1200 {
+            logger.info("⚠️ long-track HLS unavailable from client=\(client.name, privacy: .public) — falling back to progressive itag")
             let itag139 = audioOnly.first(where: { itag($0) == 139 })
             let itag140 = audioOnly.first(where: { itag($0) == 140 })
             let longPick = itag139 ?? itag140 ?? mp4s.min(by: { br($0) < br($1) })

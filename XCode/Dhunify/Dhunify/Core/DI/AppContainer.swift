@@ -70,6 +70,13 @@ final class AppContainer {
         playerViewModel: playerViewModel
     )
 
+    /// iPhone queue-refill listener. Subscribes to `.dhunifyQueueNearEnd`
+    /// and appends similar, language-filtered tracks via
+    /// `SimilarTrackProvider`. Touched lazily on first access from
+    /// `DhunifyApp` so it has app lifetime without slowing cold launch.
+    @ObservationIgnored
+    lazy var queueRefillCoordinator: QueueRefillCoordinator = QueueRefillCoordinator()
+
     @ObservationIgnored
     lazy var downloadManager: DownloadManager = DownloadManager(modelContainer: modelContainer)
 
