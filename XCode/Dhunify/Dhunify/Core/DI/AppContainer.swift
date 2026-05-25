@@ -19,6 +19,10 @@ enum Config {
     /// any song proxies the upstream CDN and populates the R2 mirror;
     /// subsequent plays are served from the nearest CF PoP.
     static let audioWorkerURL = "https://dhunify-audio.aksgajjar.workers.dev"
+    /// Fly origin — hosts `/fstream` (instant-start: itag139 fetched via
+    /// concurrent subranges + ffmpeg `-movflags +faststart` → moov-at-front
+    /// progressive MP4 → AVPlayer ready on the first ~256 KB).
+    static let flyBaseURL = "https://dhunify-api.fly.dev"
 }
 
 @MainActor

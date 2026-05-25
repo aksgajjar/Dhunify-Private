@@ -925,9 +925,13 @@ final class PlayerViewModel {
             if song.isYouTubeSource, !finalURL.isFileURL, Self.urlIsHLS(finalURL) {
                 Self.logger.info("🎵 HLS primary id=\(song.youtubeID, privacy: .public) host=\(finalURL.host ?? "?")")
             } else if song.isYouTubeSource, !finalURL.isFileURL,
-               let backendURL = Self.backendStreamURL(youtubeID: song.youtubeID) {
-                Self.logger.info("🎯 Backend playback id=\(song.youtubeID, privacy: .public) → \(backendURL.absoluteString, privacy: .public)")
-                finalURL = backendURL
+               let fstreamURL = Self.fstreamURL(youtubeID: song.youtubeID) {
+                // Faststart-remuxed progressive MP4 (moov-at-front) → AVPlayer
+                // ready on the first ~256 KB. Prewarmed next-track builds are
+                // cached → instant. `.failed`/watchdog still fall back to the
+                // worker backend (swapToBackendYTStream), so a build miss is safe.
+                Self.logger.info("⚡️ Faststart playback id=\(song.youtubeID, privacy: .public) → \(fstreamURL.absoluteString, privacy: .public)")
+                finalURL = fstreamURL
             } else if Self.relayPlaybackMode, song.isYouTubeSource, !finalURL.isFileURL,
                       let relayURL = Self.relayStreamURL(youtubeID: song.youtubeID) {
                 Self.logger.info("🔀 Relay playback id=\(song.youtubeID, privacy: .public) → \(relayURL.absoluteString, privacy: .public)")
@@ -1056,12 +1060,9 @@ final class PlayerViewModel {
             // (and discard) any warmed slot for this song so it detaches
             // from the warmer and can't be reused elsewhere.
             _ = self.takePreloadedItem(songID: song.youtubeID, allowFailed: true)
-            // PHASE RESET: vanilla AVPlayerItem with AppleCoreMedia's DEFAULT
-            // User-Agent and no custom asset options. The UA-override experiment
-            // (AVURLAssetHTTPHeaderFieldsKey) made AVPlayer's media requests use
-            // a non-default UA — URLSession warmup (default UA) fetched 206 fine
-            // while AVPlayer stalled forever in .unknown. Default UA + the
-            // standard backend stream = boring, reliable startup.
+            // Vanilla item, default AppleCoreMedia UA. (CP5 precise-timing-off
+            // reverted: no measurable readyToPlay win — the delay is worker
+            // first-byte / moov-at-EOF latency, not AVFoundation's scan.)
             let item = AVPlayerItem(url: playURL)
             // Adaptive forward buffer: 60 s on cellular / constrained
             // networks (forest, tunnels), 30 s on WiFi. Combined with
@@ -1257,7 +1258,13 @@ final class PlayerViewModel {
             //     audio bytes; would defeat the cache. Long YT tracks
             //     hit this path; AVPlayer's own segment buffer covers
             //     them at runtime.
-            if !playURL.isFileURL, !Self.urlIsHLS(playURL) {
+            // Only cache SHORT tracks. Long mixes (40-90 min) pulling the FULL
+            // file in the background doubled googlevideo traffic through the
+            // worker for no playback benefit (AVPlayer's own rolling buffer
+            // already covers play-time). Cap at 15 min: short songs still cache
+            // fully for instant offline replay; long mixes just stream.
+            let l2Duration = self.ytStreamDuration > 0 ? self.ytStreamDuration : song.duration
+            if !playURL.isFileURL, !Self.urlIsHLS(playURL), l2Duration <= 900 {
                 let cacheURL = playURL
                 let cacheID = song.youtubeID
                 Task.detached(priority: .background) {
@@ -1922,6 +1929,27 @@ final class PlayerViewModel {
     /// warm only — builds no AVPlayerItem, never touches `player`, never
     /// autoplays. Failure is silent and cannot affect live playback.
     private var relayWarmedForSongID: String?
+    private var fstreamWarmedForSongID: String?
+
+    /// Prewarm the next track's faststart build on Fly so it's cached and
+    /// instant when the queue advances. HEAD triggers Fly's resolve +
+    /// concurrent-subrange download + remux without transferring the body.
+    /// Best-effort, no player mutation, silent failure — cannot affect live
+    /// playback (mirrors `prewarmNextRelay`).
+    private func prewarmNextFstream() {
+        guard let idx = nextIndex(), queue.indices.contains(idx) else { return }
+        let next = queue[idx]
+        guard next.isYouTubeSource,
+              let url = Self.fstreamURL(youtubeID: next.youtubeID) else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "HEAD"
+        req.timeoutInterval = 90
+        let sid = next.youtubeID
+        Task.detached(priority: .utility) {
+            _ = try? await URLSession.shared.data(for: req)
+            Self.logger.info("⚡️ fstream prewarm \(sid, privacy: .public)")
+        }
+    }
 
     private func prewarmNextRelay() {
         guard let idx = nextIndex(), queue.indices.contains(idx) else { return }
@@ -1976,6 +2004,15 @@ final class PlayerViewModel {
            let cur = currentSong?.youtubeID, relayWarmedForSongID != cur {
             relayWarmedForSongID = cur
             prewarmNextRelay()
+        }
+
+        // Faststart prewarm: build the next track on Fly at ~40% so it's
+        // cached → instant when the queue advances. One-shot per song,
+        // best-effort, no player mutation.
+        if progress >= 0.4,
+           let cur = currentSong?.youtubeID, fstreamWarmedForSongID != cur {
+            fstreamWarmedForSongID = cur
+            prewarmNextFstream()
         }
 
         // Save position every ~5 seconds for resume.
@@ -2459,6 +2496,19 @@ final class PlayerViewModel {
         let id = rawID.hasPrefix("yt_") ? rawID : "yt_\(rawID)"
         guard var components = URLComponents(string: Config.backendBaseURL) else { return nil }
         components.path = "/stream"
+        components.queryItems = [URLQueryItem(name: "id", value: id)]
+        return components.url
+    }
+
+    /// Faststart stream URL — `Config.flyBaseURL/fstream?id=yt_<id>`. Fly grabs
+    /// itag139 via concurrent subranges and `ffmpeg -movflags +faststart`
+    /// repackages it into a moov-at-front progressive MP4, so AVPlayer reaches
+    /// `.readyToPlay` on the first ~256 KB (instant) instead of scanning the
+    /// whole fragmented file. Prewarmed → cached on Fly → instant.
+    static func fstreamURL(youtubeID rawID: String) -> URL? {
+        let id = rawID.hasPrefix("yt_") ? rawID : "yt_\(rawID)"
+        guard var components = URLComponents(string: Config.flyBaseURL) else { return nil }
+        components.path = "/fstream"
         components.queryItems = [URLQueryItem(name: "id", value: id)]
         return components.url
     }

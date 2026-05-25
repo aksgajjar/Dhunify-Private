@@ -57,6 +57,52 @@ Rollback Checkpoint entry below documenting: current behavior · reason for chan
 (`graphify-out/PLAYBACK_ARCHITECTURE.md`).
 
 ### Rollback checkpoints
+- **CP6 (2026-05-25) — INSTANT START: Fly faststart-remux `/fstream` + app prewarm.**
+  - *Root (CP5 proved):* slow readyToPlay = fragmented DASH (AVPlayer scans whole
+    file) + worker re-fetch every play. Unfixable app-side.
+  - *Fix (Fly, deployed):* new `GET /fstream?id=yt_<id>` on `dhunify-api.fly.dev`
+    — resolves itag139, downloads via **concurrent 4 MB subranges** (beats the
+    googlevideo per-stream throttle: 38 MB in ~0.7 s vs ~12 s), then
+    `ffmpeg -c copy -movflags +faststart` → **moov-at-front progressive MP4**
+    cached on `/tmp` (2 GB LRU). AVPlayer reads ~256 KB → **instant ready**.
+    Warm/prewarmed ttfb ~0.26 s; cold ~8-19s (resolve + 2-pass remux).
+    Image: base = current Fly image + `apt ffmpeg` (zero dep drift); deploy dir
+    `/tmp/dhunify-deploy/` (Dockerfile + main.py + fly.toml). yt-dlp pinned by
+    base image (2026.03.17). Rollback: `fly releases` → prior release.
+  - *App (this CP):* `PlayerViewModel` — (a) YT non-file non-HLS finalURL now
+    routes to `Self.fstreamURL` (`Config.flyBaseURL/fstream?id=`) instead of the
+    worker `backendStreamURL`; (b) `prewarmNextFstream()` fires a HEAD to
+    `/fstream` for the next queued track at ~40% (one-shot, detached, no player
+    mutation). HLS-primary gate unchanged; L2 `file://` unchanged; `.failed`/
+    watchdog still `swapToBackendYTStream` (worker) → build-miss safe.
+  - *Affected:* `AppContainer.Config.flyBaseURL` (new); `PlayerViewModel`
+    finalURL override block, `fstreamURL` helper, `prewarmNextFstream` +
+    `fstreamWarmedForSongID` + handleTimeUpdate trigger.
+  - *Rollback (app):* in the override change `Self.fstreamURL` back to
+    `Self.backendStreamURL` + remove the prewarm trigger; or `git checkout
+    playback-stable-2 -- .../PlayerViewModel.swift`. *(Fly stays; harmless.)*
+  - *Status:* awaiting device test (instant on prewarmed/warm; first cold tap
+    ≈ today; song-play + audio-no-stop must hold).
+- **CP5 (2026-05-25) — REVERTED (no effect). skip precise-timing scan.**
+  - *Tried:* `AVURLAsset(url:, options:[AVURLAssetPreferPreciseDurationAndTimingKey:false])`
+    to cut readyToPlay. Built + device-tested → NO measurable win. Reverted to
+    `AVPlayerItem(url: playURL)`.
+  - *Why it failed:* the flag can't help a fragmented DASH file with no `sidx` —
+    AVFoundation scans the moof fragments regardless.
+  - *Real root cause (curl-proven vs prod, 2026-05-25):* slow start is
+    **worker/Fly-side, not app-side**. (1) Fly (`dhunify-api.fly.dev`) hardcodes
+    **itag140 (~128kbps; 42MB for a 44min mix)**; ignores `?itag=`/`?quality=`.
+    (2) Worker only proxies Fly's URL — can't pick a format (worker.js:34-49
+    `resolveYouTube` → `/resolve/yt_{id}`). (3) Worker `x-cache: MISS` every
+    request → re-fetches googlevideo each play, no caching. (4) Worker won't
+    serve suffix range `bytes=-N` (returns 200 whole file). (5) `ftypdash`
+    fragmented DASH, no sidx → AVPlayer drags ~the whole file before ready.
+    (6) `?src=` bypass unusable — app's itag139 URLs are phone-IP-bound → worker
+    403; direct-from-phone throttled.
+  - *Conclusion:* no app- or worker-side fix; the only speed lever (smaller/
+    faststart/sidx audio) lives in **Fly (black-box, no source)**. Needs Fly
+    ownership: `fly ssh console -a dhunify-api` or replace the resolver.
+  - *Baseline:* tag `playback-stable-2` (727d27f) + worker `515d2782`.
 - **CP-WORKER3 (2026-05-25) — worker streaming: pull-driven ReadableStream (fixes random truncation).**
   - *Symptom:* audio stopped ~40-50s while the clock kept running, across tracks.
     Root: the `ctx.waitUntil`+TransformStream pump was killed by Cloudflare at
