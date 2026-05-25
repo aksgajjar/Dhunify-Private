@@ -915,7 +915,16 @@ final class PlayerViewModel {
             // audio/mp4 from its own egress IP → AVPlayer reaches `.readyToPlay`
             // reliably. Skip file:// (L2 offline plays locally). (Relay override
             // is retired here; relay infra stays dormant behind `relayPlaybackMode`.)
-            if song.isYouTubeSource, !finalURL.isFileURL,
+            // DUAL-PATH gate. HLS PRIMARY: when the resolver returned an HLS
+            // manifest (official music videos — IOS client yields hlsManifestUrl
+            // anonymously), hand it straight to AVPlayer for native, instant
+            // playback. Do NOT override it to the progressive backend.
+            // Progressive (long mixes/jukeboxes — no HLS) routes through the
+            // worker-stitched backend (guaranteed floor). `.failed`/watchdog
+            // still fall back to the backend, so HLS failures are covered.
+            if song.isYouTubeSource, !finalURL.isFileURL, Self.urlIsHLS(finalURL) {
+                Self.logger.info("🎵 HLS primary id=\(song.youtubeID, privacy: .public) host=\(finalURL.host ?? "?")")
+            } else if song.isYouTubeSource, !finalURL.isFileURL,
                let backendURL = Self.backendStreamURL(youtubeID: song.youtubeID) {
                 Self.logger.info("🎯 Backend playback id=\(song.youtubeID, privacy: .public) → \(backendURL.absoluteString, privacy: .public)")
                 finalURL = backendURL

@@ -57,6 +57,53 @@ Rollback Checkpoint entry below documenting: current behavior · reason for chan
 (`graphify-out/PLAYBACK_ARCHITECTURE.md`).
 
 ### Rollback checkpoints
+- **CP-WORKER3 (2026-05-25) — worker streaming: pull-driven ReadableStream (fixes random truncation).**
+  - *Symptom:* audio stopped ~40-50s while the clock kept running, across tracks.
+    Root: the `ctx.waitUntil`+TransformStream pump was killed by Cloudflare at
+    RANDOM points (same single pull gave 9.5MB once, 1.3MB next; never reliable)
+    → partial body vs Content-Length → AVPlayer played to the gap then ran silent.
+  - *Fix:* incremental pull-driven `ReadableStream` (no `waitUntil`; opens the
+    next 4MB subrange as the client drains, enqueues network-sized chunks).
+    Tied to the response lifecycle. `backend/worker/src/worker.js`.
+  - *Deployed* version `515d2782`. Verified on production: full 9.5MB on single
+    ×3 + 3-concurrent + 60s slow-read sustained (was random truncation).
+  - *Note:* an earlier pull-stream (`9001d06b`) was reverted on a misread — the
+    "resource unavailable" was a backend 502 (googlevideo 403) on a long song,
+    not the pull-stream.
+  - *Rollback:* `wrangler rollback` to a prior version (e.g. `b20f7e16`).
+- **OPEN: long-song 502.** 60/89-min videos → worker `502 {"error":"CDN returned
+  403"}` (googlevideo rejects the Fly-resolved URL). Separate from streaming;
+  worker resolve/retry issue for ultra-long videos. Not yet fixed.
+- **CP-WORKER2 (2026-05-24) — fix worker stream truncation (continuity).**
+  - *Symptom:* progressive audio started fine, then went SILENT ~50s in while the
+    AVPlayer clock kept advancing. Root: the worker's large-range streaming branch
+    used `ctx.waitUntil` + TransformStream pump, which **Cloudflare truncated early
+    on production** (~3-6MB of 40MB; 10MB req→6MB) → body shorter than advertised
+    Content-Length → AVPlayer ran past received bytes = silence-with-clock.
+    (Bytes delivered were correct/contiguous — pure truncation, not corruption.)
+  - *Fix:* replaced the pump with a consumer-driven `ReadableStream({ pull })`
+    tied to the response lifecycle (fetches next 4MB subrange as the client
+    drains). Buffered branch (≤8MB) unchanged. `backend/worker/src/worker.js`.
+  - *Deployed* version `9001d06b`. Verified: full 40MB delivered (was 2.6MB);
+    96 KB/s slow read sustained full 60s (was dying ~22s).
+  - *Rollback:* revert worker.js streaming branch, `wrangler deploy`.
+- **CP-DUAL (2026-05-24) — dual-path gate: HLS primary (music), worker-progressive floor.**
+  - *Finding (resolver spike):* YouTube serves `hlsManifestUrl` to the app's
+    existing IOS client **anonymously, but only for official music videos**
+    (verified: `dQw4w9WgXcQ`→HLS; long mixes→none). Long user mixes/jukeboxes
+    (the app's bulk content) get progressive itag 139 only. `web_safari`/
+    `tv_embedded` HLS needs the PO-token/SABR handshake (heavy, fragile) — NOT
+    pursued. The CP-RESET backend override was discarding the HLS URLs IOS
+    already returns for music.
+  - *Change (one block in `loadCurrentSong`):* gate the backend override on
+    `Self.urlIsHLS(finalURL)`. HLS URL → kept → native AVPlayer (instant).
+    Non-HLS → backend worker (stitched progressive floor). No resolver change,
+    no PO-token machinery, preload still off, fallback (`.failed`/watchdog →
+    `swapToBackendYTStream`) intact.
+  - *Affected:* `PlayerViewModel.swift` finalURL override block only. Uses
+    existing `urlIsHLS` (L2468).
+  - *Rollback:* delete the leading `if … urlIsHLS(finalURL) { … } else ` branch
+    → reverts to backend-always; or `git checkout playback-stable -- …`.
 - **CP-WORKER (2026-05-24) — THE FIX: bounded-subrange stitching in the Cloudflare Worker.**
   - *Root cause (finally):* app → `api.heyandirect.com` → 302 → Cloudflare Worker
     (`dhunify-audio…workers.dev`, `backend/worker/src/worker.js`). On R2 miss the

@@ -1,0 +1,20 @@
+name = "dhunify-audio"
+main = "src/worker.js"
+compatibility_date = "2024-09-23"
+
+# Free plan works. Upgrade to Workers Paid ($5/mo) for 10M req/day.
+
+# v7 — adds R2 edge cache. First play proxies upstream (JioSaavn or
+# Fly resolver → googlevideo) AND populates R2 in the background.
+# Subsequent plays of the same song come direct from R2 at the nearest
+# Cloudflare PoP.
+
+[vars]
+BACKEND_URL = "https://dhunify-api.fly.dev"
+
+[[r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "dhunify-audio"
+
+[observability]
+enabled = true
