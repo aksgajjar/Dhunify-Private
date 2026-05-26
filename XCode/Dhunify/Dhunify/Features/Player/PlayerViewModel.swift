@@ -926,10 +926,12 @@ final class PlayerViewModel {
                 Self.logger.info("🎵 HLS primary id=\(song.youtubeID, privacy: .public) host=\(finalURL.host ?? "?")")
             } else if song.isYouTubeSource, !finalURL.isFileURL,
                let fstreamURL = Self.fstreamURL(youtubeID: song.youtubeID) {
-                // Faststart-remuxed progressive MP4 (moov-at-front) → AVPlayer
-                // ready on the first ~256 KB. Prewarmed next-track builds are
-                // cached → instant. `.failed`/watchdog still fall back to the
-                // worker backend (swapToBackendYTStream), so a build miss is safe.
+                // Faststart: Fly returns a moov-at-front progressive MP4 (whole
+                // file). AVPlayer plays + byte-range SEEKS it freely (scrub works
+                // across the whole mashup). Cold = build (~3-5s typical on the
+                // 4-CPU box, longer for 2hr mixes); prewarmed/replayed instant.
+                // (BHLS gave instant-start but AVPlayer wouldn't seek it.)
+                // `.failed`/watchdog fall back to the worker (swapToBackendYTStream).
                 Self.logger.info("⚡️ Faststart playback id=\(song.youtubeID, privacy: .public) → \(fstreamURL.absoluteString, privacy: .public)")
                 finalURL = fstreamURL
             } else if Self.relayPlaybackMode, song.isYouTubeSource, !finalURL.isFileURL,
@@ -1941,8 +1943,9 @@ final class PlayerViewModel {
         let id = rawID.hasPrefix("yt_") ? rawID : "yt_\(rawID)"
         guard fstreamPrewarmedIDs.insert(id).inserted,
               let url = Self.fstreamURL(youtubeID: id) else { return }
+        // GET the faststart URL → Fly pre-builds (download+remux) the next track
+        // so the tap is an instant cache hit. Best-effort, no player mutation.
         var req = URLRequest(url: url)
-        req.httpMethod = "HEAD"
         req.timeoutInterval = 90
         Task.detached(priority: .utility) {
             _ = try? await URLSession.shared.data(for: req)
@@ -2517,6 +2520,18 @@ final class PlayerViewModel {
         guard var components = URLComponents(string: Config.flyBaseURL) else { return nil }
         components.path = "/fstream"
         components.queryItems = [URLQueryItem(name: "id", value: id)]
+        return components.url
+    }
+
+    /// Byte-range HLS URL — `Config.flyBaseURL/bhls/yt_<id>/index.m3u8`. Fly
+    /// parses the itag139 `sidx` and emits a COMPLETE VOD HLS playlist whose
+    /// segments are EXT-X-BYTERANGE sub-ranges of the raw file (proxied via Fly).
+    /// AVPlayer starts + seeks via byte-ranges — no download, no remux → cold
+    /// ~2-3s REGARDLESS of track length. `.m3u8` → native HLS path (`urlIsHLS`).
+    static func flyBHLSURL(youtubeID rawID: String) -> URL? {
+        let id = rawID.hasPrefix("yt_") ? rawID : "yt_\(rawID)"
+        guard var components = URLComponents(string: Config.flyBaseURL) else { return nil }
+        components.path = "/bhls/\(id)/index.m3u8"
         return components.url
     }
 
