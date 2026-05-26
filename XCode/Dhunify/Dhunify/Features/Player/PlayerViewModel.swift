@@ -694,20 +694,12 @@ final class PlayerViewModel {
     // readyToPlay → audible, to localize the next-song delay. Pure logging;
     // remove after Phase 1 diagnosis. Touches no playback behavior.
     private var transitionStart: DispatchTime?
-    private func tmark(_ label: String) {
-        guard let s = transitionStart else { return }
-        let ms = (DispatchTime.now().uptimeNanoseconds &- s.uptimeNanoseconds) / 1_000_000
-        Self.logger.info("⏱️ T+\(ms)ms \(label)")
-    }
+    // Diagnostics neutered (CP-VLC-2a done) — call sites kept but emit
+    // nothing. Re-enable by restoring the bodies if a future regression
+    // needs the transition timing / CarPlay state snapshot.
+    private func tmark(_ label: String) {}
 
-    // DIAGNOSTIC (CarPlay regression, temporary, behavior-free): one-line
-    // player/route state snapshot to localize where a next-track stalls while
-    // CarPlay is attached. Pure logging; remove after diagnosis.
-    private func cpdiag(_ at: String) {
-        let route = AVAudioSession.sharedInstance().currentRoute.outputs
-            .map { $0.portType.rawValue }.joined(separator: ",")
-        Self.logger.info("🚗DIAG \(at) | isLoadingItem=\(self.isLoadingItem) loadingSongID=\(self.loadingSongID ?? "nil") loadToken=\(self.loadToken) idx=\(self.currentIndex) q=\(self.queue.count) hasItem=\(self.player.currentItem != nil) tcs=\(self.player.timeControlStatus.rawValue) wantsToPlay=\(self.wantsToPlay) route=[\(route)]")
-    }
+    private func cpdiag(_ at: String) {}
 
     private func loadCurrentSong() {
         let loadTargetID = currentSong?.youtubeID
