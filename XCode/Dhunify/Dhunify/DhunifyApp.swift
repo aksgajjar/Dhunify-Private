@@ -132,6 +132,12 @@ struct DhunifyApp: App {
         } else {
             vm.restoreQueue([song], startIndex: 0)
         }
+        // Prewarm the resumed track's faststart build during the launch→tap
+        // lead time so the first play() is instant (cache hit) instead of a
+        // ~4-5s cold build.
+        if let resumed = vm.currentSong, resumed.isYouTubeSource {
+            vm.prewarmFstream(youtubeID: resumed.youtubeID)
+        }
         // Arm resume so first play() — whether from UI tap or CarPlay
         // route activation firing MPRemoteCommandCenter.playCommand —
         // seeks to last saved position instead of restarting at 0.

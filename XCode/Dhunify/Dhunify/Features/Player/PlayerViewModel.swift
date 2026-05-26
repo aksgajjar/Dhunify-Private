@@ -1930,25 +1930,32 @@ final class PlayerViewModel {
     /// autoplays. Failure is silent and cannot affect live playback.
     private var relayWarmedForSongID: String?
     private var fstreamWarmedForSongID: String?
+    private var fstreamPrewarmedIDs: Set<String> = []
 
-    /// Prewarm the next track's faststart build on Fly so it's cached and
-    /// instant when the queue advances. HEAD triggers Fly's resolve +
-    /// concurrent-subrange download + remux without transferring the body.
-    /// Best-effort, no player mutation, silent failure — cannot affect live
-    /// playback (mirrors `prewarmNextRelay`).
-    private func prewarmNextFstream() {
-        guard let idx = nextIndex(), queue.indices.contains(idx) else { return }
-        let next = queue[idx]
-        guard next.isYouTubeSource,
-              let url = Self.fstreamURL(youtubeID: next.youtubeID) else { return }
+    /// Trigger the Fly faststart build for a YouTube id so it's cached before
+    /// playback (→ instant `readyToPlay`). HEAD runs the build without
+    /// transferring the body. Deduped per id, best-effort, silent failure, no
+    /// player mutation — cannot affect live playback. Safe to call on any
+    /// "likely to play soon" signal (launch resume, next track).
+    func prewarmFstream(youtubeID rawID: String) {
+        let id = rawID.hasPrefix("yt_") ? rawID : "yt_\(rawID)"
+        guard fstreamPrewarmedIDs.insert(id).inserted,
+              let url = Self.fstreamURL(youtubeID: id) else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "HEAD"
         req.timeoutInterval = 90
-        let sid = next.youtubeID
         Task.detached(priority: .utility) {
             _ = try? await URLSession.shared.data(for: req)
-            Self.logger.info("⚡️ fstream prewarm \(sid, privacy: .public)")
+            Self.logger.info("⚡️ fstream prewarm \(id, privacy: .public)")
         }
+    }
+
+    /// Prewarm the next queued track so the queue advance is instant.
+    private func prewarmNextFstream() {
+        guard let idx = nextIndex(), queue.indices.contains(idx) else { return }
+        let next = queue[idx]
+        guard next.isYouTubeSource else { return }
+        prewarmFstream(youtubeID: next.youtubeID)
     }
 
     private func prewarmNextRelay() {
