@@ -922,8 +922,21 @@ final class PlayerViewModel {
             // Progressive (long mixes/jukeboxes — no HLS) routes through the
             // worker-stitched backend (guaranteed floor). `.failed`/watchdog
             // still fall back to the backend, so HLS failures are covered.
+            var useResourceLoader = false
+            var rlContentLength: Int64 = 0
             if song.isYouTubeSource, !finalURL.isFileURL, Self.urlIsHLS(finalURL) {
                 Self.logger.info("🎵 HLS primary id=\(song.youtubeID, privacy: .public) host=\(finalURL.host ?? "?")")
+            } else if Self.resourceLoaderMode, song.isYouTubeSource, !finalURL.isFileURL,
+                      !Self.urlIsHLS(finalURL),
+                      let clen = YTStreamResourceLoader.contentLength(from: finalURL) {
+                // EXPERIMENTAL: play the RAW googlevideo stream on-device via an
+                // AVAssetResourceLoaderDelegate. Bounded sub-range fetches defeat
+                // the open-range throttle that historically stuck direct play.
+                // No Fly resolve/download/remux. finalURL stays the raw
+                // googlevideo URL; the item is built with the resource loader below.
+                rlContentLength = clen
+                useResourceLoader = true
+                Self.logger.info("🧪 ResourceLoader playback id=\(song.youtubeID, privacy: .public) clen=\(clen)")
             } else if song.isYouTubeSource, !finalURL.isFileURL,
                let fstreamURL = Self.fstreamURL(youtubeID: song.youtubeID) {
                 // Faststart: Fly returns a moov-at-front progressive MP4 (whole
@@ -1062,10 +1075,18 @@ final class PlayerViewModel {
             // (and discard) any warmed slot for this song so it detaches
             // from the warmer and can't be reused elsewhere.
             _ = self.takePreloadedItem(songID: song.youtubeID, allowFailed: true)
-            // Vanilla item, default AppleCoreMedia UA. (CP5 precise-timing-off
-            // reverted: no measurable readyToPlay win — the delay is worker
-            // first-byte / moov-at-EOF latency, not AVFoundation's scan.)
-            let item = AVPlayerItem(url: playURL)
+            // Item build. EXPERIMENTAL resource-loader path: raw googlevideo
+            // served on-device via bounded sub-ranges (no Fly). Else vanilla
+            // item (Fly faststart URL or HLS).
+            let item: AVPlayerItem
+            if useResourceLoader,
+               let (rlAsset, rlLoader) = YTStreamResourceLoader.makeAsset(realURL: playURL, contentLength: rlContentLength) {
+                self.ytResourceLoader = rlLoader  // retain for the asset's lifetime
+                item = AVPlayerItem(asset: rlAsset)
+            } else {
+                self.ytResourceLoader = nil
+                item = AVPlayerItem(url: playURL)
+            }
             // Adaptive forward buffer: 60 s on cellular / constrained
             // networks (forest, tunnels), 30 s on WiFi. Combined with
             // `automaticallyWaitsToMinimizeStalling=true` this lets
@@ -1260,11 +1281,10 @@ final class PlayerViewModel {
             //     audio bytes; would defeat the cache. Long YT tracks
             //     hit this path; AVPlayer's own segment buffer covers
             //     them at runtime.
-            // Only cache SHORT tracks. Long mixes (40-90 min) pulling the FULL
-            // file in the background doubled googlevideo traffic through the
-            // worker for no playback benefit (AVPlayer's own rolling buffer
-            // already covers play-time). Cap at 15 min: short songs still cache
-            // fully for instant offline replay; long mixes just stream.
+            // Cache SHORT tracks only. Caching long mixes in the background
+            // (full-file download) contends with the live stream + prewarm on
+            // both the phone network and Fly → ballooned cold builds to 7-12s.
+            // Cap at 15 min: short songs cache for instant replay; long mixes stream.
             let l2Duration = self.ytStreamDuration > 0 ? self.ytStreamDuration : song.duration
             if !playURL.isFileURL, !Self.urlIsHLS(playURL), l2Duration <= 900 {
                 let cacheURL = playURL
@@ -1932,6 +1952,9 @@ final class PlayerViewModel {
     /// autoplays. Failure is silent and cannot affect live playback.
     private var relayWarmedForSongID: String?
     private var fstreamWarmedForSongID: String?
+    /// Retains the active resource-loader delegate for the current item's
+    /// lifetime (EXPERIMENTAL resourceLoaderMode). Dropped/replaced per load.
+    private var ytResourceLoader: YTStreamResourceLoader?
     private var fstreamPrewarmedIDs: Set<String> = []
 
     /// Trigger the Fly faststart build for a YouTube id so it's cached before
@@ -2016,10 +2039,12 @@ final class PlayerViewModel {
             prewarmNextRelay()
         }
 
-        // Faststart prewarm: build the next track on Fly at ~40% so it's
-        // cached → instant when the queue advances. One-shot per song,
-        // best-effort, no player mutation.
-        if progress >= 0.4,
+        // Faststart prewarm: build the next track on Fly ~5s into the current
+        // one (NOT at 40% — on long mixes the user advances long before 40%, so
+        // the next track was never warmed). Early fire = next is pre-built on
+        // Fly while this plays → advance/skip is a cache hit (instant) or at
+        // least resolve-warm (~2s). One-shot per song, no player mutation.
+        if secs >= 5,
            let cur = currentSong?.youtubeID, fstreamWarmedForSongID != cur {
             fstreamWarmedForSongID = cur
             prewarmNextFstream()
@@ -2479,6 +2504,14 @@ final class PlayerViewModel {
     /// gracefully fall back (webm→mp4, backend stream) — "music always plays".
     /// Re-enable relay only in a later phase with a working fallback in place.
     static let relayPlaybackMode = false
+
+    /// EXPERIMENTAL — DISABLED (tested 2026-05-26: readyToPlay 18-27s, WORSE).
+    /// AVPlayer still scans the whole raw fragmented file before ready, even
+    /// fed via the resource loader → the bounded-range throttle-bypass didn't
+    /// help. Confirms AVPlayer can't play YouTube's raw stream fast (matches
+    /// Yattee's "AVPlayer slow" warning). Kept off; faststart (Fly) is the
+    /// AVPlayer ceiling. True instant needs mpv/VLC (different engine).
+    static let resourceLoaderMode = false
 
     /// Legacy aggressive next-track preload stays OFF independently of
     /// `relayPlaybackMode` — it raced AVPlayerItem installs. Decoupled so

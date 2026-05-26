@@ -484,6 +484,20 @@ struct PlayerView: View {
             Spacer()
 
             Button {
+                HapticManager.light()
+                viewModel.skipBackward(seconds: 30)
+            } label: {
+                Image(systemName: "gobackward.30")
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(.white)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(ScalePressButtonStyle())
+
+            Spacer()
+
+            Button {
                 HapticManager.medium()
                 viewModel.togglePlayPause()
             } label: {
@@ -510,6 +524,20 @@ struct PlayerView: View {
                     y: 8
                 )
                 .animation(.easeInOut(duration: 0.25), value: pending)
+            }
+            .buttonStyle(ScalePressButtonStyle())
+
+            Spacer()
+
+            Button {
+                HapticManager.light()
+                viewModel.skipForward(seconds: 30)
+            } label: {
+                Image(systemName: "goforward.30")
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(.white)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(ScalePressButtonStyle())
 
