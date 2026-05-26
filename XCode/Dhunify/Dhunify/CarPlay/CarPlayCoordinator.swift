@@ -189,11 +189,20 @@ final class CarPlayCoordinator: NSObject {
         let searchButton = CPBarButton(image: UIImage(systemName: "magnifyingglass") ?? UIImage()) { [weak self] _ in
             self?.presentSearch()
         }
-        homeTemplate.trailingNavigationBarButtons = [searchButton]
-        lastPlayedTemplate.trailingNavigationBarButtons = [searchButton]
-        mashupTemplate.trailingNavigationBarButtons = [searchButton]
-        libraryTemplate.trailingNavigationBarButtons = [searchButton]
-        downloadsTemplate.trailingNavigationBarButtons = [searchButton]
+        // Radio button sits beside Search on every tab so the driver can
+        // jump to live stations from any context (CarPlay caps the tab
+        // bar at 5, all of which are taken — a nav-bar button keeps Radio
+        // top-level without dropping a tab). Up to 2 trailing buttons are
+        // allowed, so [search, radio] is within budget.
+        let radioButton = CPBarButton(image: UIImage(systemName: "antenna.radiowaves.left.and.right") ?? UIImage()) { [weak self] _ in
+            self?.presentRadio()
+        }
+        let navButtons = [searchButton, radioButton]
+        homeTemplate.trailingNavigationBarButtons = navButtons
+        lastPlayedTemplate.trailingNavigationBarButtons = navButtons
+        mashupTemplate.trailingNavigationBarButtons = navButtons
+        libraryTemplate.trailingNavigationBarButtons = navButtons
+        downloadsTemplate.trailingNavigationBarButtons = navButtons
 
         // Last Played — Resume row + Recents + Top Played. Sync from UserDefaults.
         refreshLastPlayed()
@@ -1168,6 +1177,39 @@ final class CarPlayCoordinator: NSObject {
             if let error {
                 coordinatorLogger.error("🚗 presentSearch push failed: \(error.localizedDescription)")
             }
+        }
+    }
+
+    /// Pushes a CPListTemplate of live radio stations, grouped by
+    /// category. Tapping a station starts it on the shared RadioViewModel
+    /// (its own AVPlayer; it pauses the song player + hijacks next/prev
+    /// for station nav) and surfaces the now-playing screen.
+    private func presentRadio() {
+        guard let controller = interfaceController else { return }
+        let template = CPListTemplate(title: "Radio", sections: makeRadioSections())
+        controller.pushTemplate(template, animated: true) { _, error in
+            if let error {
+                coordinatorLogger.error("🚗 presentRadio push failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// One section per RadioCategory; rows are the stations in that
+    /// category. Empty categories are dropped.
+    private func makeRadioSections() -> [CPListSection] {
+        RadioCategory.allCases.compactMap { category -> CPListSection? in
+            let stations = RadioStation.all.filter { $0.category == category }
+            guard !stations.isEmpty else { return nil }
+            let items = stations.map { station -> CPListItem in
+                let item = CPListItem(text: "\(station.emoji) \(station.name)", detailText: station.description)
+                item.handler = { [weak self] _, completion in
+                    RadioViewModel.shared.play(station: station)
+                    self?.pushNowPlaying()
+                    completion()
+                }
+                return item
+            }
+            return CPListSection(items: items, header: category.rawValue, sectionIndexTitle: nil)
         }
     }
 

@@ -68,6 +68,12 @@ final class CarPlayNowPlayingUpdater {
     // MARK: - Now Playing mirror
 
     private func update() {
+        // While radio is live it owns MPNowPlayingInfoCenter (its own
+        // AVPlayer + station metadata + remote-command hijack). The song
+        // player is paused, so mirroring it here would clobber the radio
+        // card with stale paused-song info on every observation tick.
+        guard !RadioViewModel.isAnyRadioPlaying else { return }
+
         var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
 
         if let song = playerViewModel.currentSong {

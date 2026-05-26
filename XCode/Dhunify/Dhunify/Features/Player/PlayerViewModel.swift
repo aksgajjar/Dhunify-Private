@@ -2594,9 +2594,11 @@ final class PlayerViewModel {
     /// Re-enable relay only in a later phase with a working fallback in place.
     static let relayPlaybackMode = false
 
-    /// STAGE 1b SMOKE TEST: route YouTube playback to VLCAudioSmokePlayer (raw
-    /// googlevideo URL, NO integration — no now-playing/seek/UI) purely to
-    /// measure VLC time-to-audible vs our 4-6s. Off = normal faststart.
+    /// VLC engine gate (CP-VLC-2a). True = YouTube-progressive plays through
+    /// `vlcEngine` (raw IP-bound googlevideo direct, audible ~1-2s — the fast
+    /// path AVPlayer can't serve). False = AVPlayer faststart (Fly /fstream,
+    /// ~4-6s). Fully integrated: play/pause/seek/now-playing route via
+    /// `usingVLC`. file:// + HLS + JioSaavn stay on AVPlayer regardless.
     static let vlcSmokeTest = true
 
     /// EXPERIMENTAL — DISABLED (tested 2026-05-26: readyToPlay 18-27s, WORSE).

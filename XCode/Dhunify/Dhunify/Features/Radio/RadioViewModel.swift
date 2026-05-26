@@ -15,6 +15,12 @@ private let logger = Logger(subsystem: "com.diphoria.Dhunify", category: "Radio"
 @Observable
 final class RadioViewModel {
 
+    /// Shared instance so the phone Radio screen and CarPlay drive ONE
+    /// radio engine (single AVPlayer + one remote-command hijack). Two
+    /// instances would each own an AVPlayer and fight over now-playing /
+    /// audio focus.
+    @MainActor static let shared = RadioViewModel()
+
     /// Process-wide flag checked by non-Radio surfaces (e.g. the
     /// CarPlay playback watchdog) so they can avoid interfering with
     /// an active radio stream.

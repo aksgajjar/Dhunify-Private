@@ -6,7 +6,7 @@
 import SwiftUI
 
 struct RadioView: View {
-    @State private var viewModel = RadioViewModel()
+    @State private var viewModel = RadioViewModel.shared
 
     var body: some View {
         ZStack(alignment: .bottom) {
