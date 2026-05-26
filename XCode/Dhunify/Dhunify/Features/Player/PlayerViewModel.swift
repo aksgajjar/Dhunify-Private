@@ -89,11 +89,15 @@ final class PlayerViewModel {
     var showEqualizer: Bool = false
     var shuffledIndices: [Int] = []
     var volume: Float = 1.0 {
-        didSet { player.volume = volume }
+        didSet {
+            player.volume = volume
+            if usingVLC { vlcEngine.setVolume(volume) }
+        }
     }
     var playbackSpeed: Float = 1.0 {
         didSet {
-            if isPlaying { player.rate = playbackSpeed }
+            if usingVLC { vlcEngine.setRate(playbackSpeed) }
+            else if isPlaying { player.rate = playbackSpeed }
         }
     }
 
@@ -104,6 +108,18 @@ final class PlayerViewModel {
     var playbackError: String? = nil
 
     private let player = AVPlayer()
+
+    // MARK: - VLC engine (YT-progressive path)
+
+    /// Plays the raw IP-bound googlevideo progressive stream directly —
+    /// the fast path AVPlayer can't serve. Gated behind `vlcSmokeTest`.
+    /// AVPlayer still owns file:// offline, HLS, and JioSaavn.
+    private let vlcEngine = VLCPlaybackEngine()
+    /// True while the current load is driven by `vlcEngine` instead of
+    /// `player`. Every control surface (play/pause/seek/now-playing) and
+    /// the AVPlayer KVO observers branch on this so the two engines never
+    /// fight over playback state.
+    private var usingVLC = false
 
     // MARK: - Gapless preload (background buffer-warmer)
 
@@ -268,7 +284,43 @@ final class PlayerViewModel {
         observeAirPlayRoute()
         setupRemoteCommands()
         startNetworkPathMonitor()
+        wireVLCEngine()
         loadCurrentSong()
+    }
+
+    /// Bridges VLC engine events to the published player state so the
+    /// existing UI bindings + now-playing center keep working unchanged.
+    private func wireVLCEngine() {
+        vlcEngine.onPlaying = { [weak self] playing in
+            guard let self, self.usingVLC else { return }
+            self.isPlaying = playing
+            if playing {
+                self.isBuffering = false
+                self.clearPlayFeedback()
+            }
+            self.updateNowPlayingPlaybackState()
+        }
+        vlcEngine.onTime = { [weak self] seconds, vlcDuration in
+            guard let self, self.usingVLC, !self.isSeeking else { return }
+            self.currentTime = seconds
+            if self.duration <= 0, vlcDuration > 0 { self.duration = vlcDuration }
+            self.progress = self.duration > 0 ? min(max(seconds / self.duration, 0), 1) : 0
+            self.updateNowPlayingPlaybackState()
+            if Int(seconds) % 5 == 0, seconds > 1 {
+                LastPlayedPersistence.savePosition(seconds)
+            }
+        }
+        vlcEngine.onEnded = { [weak self] in
+            guard let self, self.usingVLC else { return }
+            Self.logger.info("🟣 VLC track ended → advancing")
+            switch self.repeatMode {
+            case .one:
+                self.vlcEngine.seek(toSeconds: 0)
+                self.vlcEngine.play()
+            case .off, .all:
+                self.nextTrack()
+            }
+        }
     }
 
     func setQueue(_ queue: [Song], startIndex: Int, categorySeed: String? = nil) {
@@ -365,6 +417,10 @@ final class PlayerViewModel {
         timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                // VLC owns playback state on the YT-progressive path —
+                // ignore the idle AVPlayer's status churn (no item = endless
+                // WAITING) so it can't flip isPlaying or arm stall recovery.
+                guard !self.usingVLC else { return }
                 switch player.timeControlStatus {
                 case .playing:
                     Self.logger.info("⏯️ timeControlStatus → PLAYING")
@@ -713,6 +769,12 @@ final class PlayerViewModel {
         unknownStatusWatchdog?.cancel()
         unknownStatusWatchdog = nil
 
+        // Tear down any VLC playback from the previous load. The async
+        // resolve below re-arms it (and `usingVLC`) only if this song
+        // routes to the VLC path; non-VLC loads (file://, HLS) leave it off.
+        vlcEngine.stop()
+        usingVLC = false
+
         // Observers gone — now safe to stop + detach the outgoing item.
         player.pause()
         player.volume = volume // reset from any crossfade
@@ -922,6 +984,33 @@ final class PlayerViewModel {
             // Progressive (long mixes/jukeboxes — no HLS) routes through the
             // worker-stitched backend (guaranteed floor). `.failed`/watchdog
             // still fall back to the backend, so HLS failures are covered.
+            // STAGE 2a: YT-progressive plays through the VLC engine. VLC plays
+            // the raw IP-bound googlevideo stream directly + fast (AVPlayer
+            // can't). Fully integrated — play/pause/seek/now-playing route to
+            // the engine via `usingVLC`. AVPlayer stays out of this load (no
+            // item, no KVO, no watchdogs). HLS + file:// fall through to AVPlayer.
+            if Self.vlcSmokeTest, song.isYouTubeSource, !finalURL.isFileURL,
+               !Self.urlIsHLS(finalURL) {
+                guard loadGen == self.loadToken else { return }
+                self.player.replaceCurrentItem(with: nil)  // silence AVPlayer
+                self.usingVLC = true
+                let dur = self.ytStreamDuration > 0 ? self.ytStreamDuration : song.duration
+                self.duration = dur
+                self.currentTime = 0
+                self.progress = 0
+                self.isBuffering = true
+                self.vlcEngine.load(
+                    url: finalURL,
+                    autoplay: self.wantsToPlay,
+                    rate: self.playbackSpeed,
+                    volume: self.volume
+                )
+                self.isLoadingItem = false
+                self.loadingSongID = nil
+                self.setupNowPlaying()
+                Self.logger.info("🟣 VLC engine playing id=\(song.youtubeID, privacy: .public) dur=\(Int(dur))s autoplay=\(self.wantsToPlay)")
+                return
+            }
             var useResourceLoader = false
             var rlContentLength: Int64 = 0
             if song.isYouTubeSource, !finalURL.isFileURL, Self.urlIsHLS(finalURL) {
@@ -2505,6 +2594,11 @@ final class PlayerViewModel {
     /// Re-enable relay only in a later phase with a working fallback in place.
     static let relayPlaybackMode = false
 
+    /// STAGE 1b SMOKE TEST: route YouTube playback to VLCAudioSmokePlayer (raw
+    /// googlevideo URL, NO integration — no now-playing/seek/UI) purely to
+    /// measure VLC time-to-audible vs our 4-6s. Off = normal faststart.
+    static let vlcSmokeTest = true
+
     /// EXPERIMENTAL — DISABLED (tested 2026-05-26: readyToPlay 18-27s, WORSE).
     /// AVPlayer still scans the whole raw fragmented file before ready, even
     /// fed via the resource loader → the bounded-range throttle-bypass didn't
@@ -2693,6 +2787,14 @@ final class PlayerViewModel {
         wantsToPlay = true
         cpdiag("play() ENTER")
 
+        if usingVLC {
+            vlcEngine.play()
+            isPlaying = true
+            clearPlayFeedback()
+            updateNowPlayingPlaybackState()
+            return
+        }
+
         guard player.currentItem != nil else {
             // Avoid stacking a second loadCurrentSong on top of an
             // in-flight one. The KVO observer on item.status will
@@ -2724,6 +2826,12 @@ final class PlayerViewModel {
     func pause() {
         wantsToPlay = false
         clearPlayFeedback()
+        if usingVLC {
+            vlcEngine.pause()
+            isPlaying = false
+            updateNowPlayingPlaybackState()
+            return
+        }
         player.pause()
         isPlaying = false
         updateNowPlayingPlaybackState()
@@ -2779,6 +2887,8 @@ final class PlayerViewModel {
     func stop() {
         wantsToPlay = false
         clearPlayFeedback(animated: false)
+        vlcEngine.stop()
+        usingVLC = false
         player.pause()
         player.replaceCurrentItem(with: nil)
         clearAllPreloadedItems()
@@ -2807,6 +2917,19 @@ final class PlayerViewModel {
         guard duration > 0 else { return }
         let clamped = max(0, min(progress, 1))
         let targetSeconds = duration * clamped
+
+        if usingVLC {
+            isSeeking = true
+            vlcEngine.seek(toSeconds: targetSeconds)
+            currentTime = targetSeconds
+            self.progress = clamped
+            updateNowPlayingPlaybackState()
+            if wantsToPlay, !isPlaying { vlcEngine.play() }
+            isSeeking = false
+            lastSeekFinishedAt = Date()
+            return
+        }
+
         let target = CMTime(seconds: targetSeconds, preferredTimescale: 600)
         // Indefinite tolerance lets AVPlayer land on the nearest keyframe
         // instead of forcing a frame-accurate fetch. On progressive YT
@@ -2919,6 +3042,13 @@ final class PlayerViewModel {
     }
 
     private func seekToStart() {
+        if usingVLC {
+            vlcEngine.seek(toSeconds: 0)
+            currentTime = 0
+            progress = 0
+            updateNowPlayingPlaybackState()
+            return
+        }
         let zero = CMTime.zero
         player.seek(to: zero, toleranceBefore: .zero, toleranceAfter: .zero)
         currentTime = 0

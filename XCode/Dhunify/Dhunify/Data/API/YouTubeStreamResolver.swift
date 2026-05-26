@@ -136,6 +136,16 @@ final class YouTubeStreamResolver {
         ]
     }
 
+    /// EXPERIMENTAL (pairs with PlayerViewModel.vlcSmokeTest). When true,
+    /// long-track resolve SKIPS the HLS-hunt chain (IOS_MUSIC → TVHTML5 →
+    /// IOS) and goes ANDROID_VR-first for direct itag139. The HLS hunt
+    /// existed because AVPlayer can't sustain IP-bound progressive MP4 on
+    /// 20+ min tracks — but VLC plays IP-bound progressive fine, so the 3
+    /// HLS round-trips are pure latency (~3-4s → ~200-600ms). ANDROID_VR is
+    /// the only client whose IP-bound URL the accept-loop keeps, so it must
+    /// lead. Flip false to restore HLS-first for the AVPlayer path.
+    static var vlcDirectLongTrack = true
+
     /// Name of the client whose last resolve succeeded. Next resolve
     /// tries this client first so repeated plays avoid wasting a round
     /// trip on the client that previously lost. Process-lifetime only —
@@ -415,6 +425,13 @@ final class YouTubeStreamResolver {
     /// path on the next long track without this skip.
     private func orderedChain(forLongTrack: Bool = false) -> [(name: String, version: String, userAgent: String)] {
         if forLongTrack {
+            if Self.vlcDirectLongTrack {
+                // VLC plays IP-bound progressive directly — skip the HLS
+                // hunt, go ANDROID_VR-first (IOS as backstop).
+                let chain = [clientChain[1], clientChain[0]]
+                logger.info("🧪 DBG VLC-direct long-track chain: \(chain.map(\.name).joined(separator: " → "), privacy: .public)")
+                return chain
+            }
             logger.info("🧪 DBG long-track chain order: \(self.longTrackChain.map(\.name).joined(separator: " → "), privacy: .public)")
             return longTrackChain
         }

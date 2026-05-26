@@ -57,6 +57,31 @@ Rollback Checkpoint entry below documenting: current behavior · reason for chan
 (`graphify-out/PLAYBACK_ARCHITECTURE.md`).
 
 ### Rollback checkpoints
+- **CP-VLC-2a (2026-05-26) — VLC engine for YT-progressive (replaces AVPlayer faststart).**
+  - *Root:* AVPlayer can't fast-start YouTube's raw fragmented itag139 (scans
+    whole moov) — faststart via Fly was ~4-6s. Smoke test proved VLC plays the
+    raw IP-bound googlevideo URL directly, audible ~1.1-2.4s, NO Fly/worker/remux.
+  - *Fix:* new `Core/Playback/VLCPlaybackEngine.swift` (owns `VLCMediaPlayer`,
+    `import VLCKitSPM`). PlayerViewModel routes the YT non-file non-HLS path
+    through it, gated on `vlcSmokeTest` + new `usingVLC` flag. Engine callbacks
+    (`onTime`/`onPlaying`/`onEnded`) drive `currentTime`/`duration`/`progress`/
+    `isPlaying` → existing UI + now-playing bindings unchanged. AVPlayer fully
+    OUT of VLC loads (no item/KVO/watchdog); timeControlStatus observer guards
+    `!usingVLC`. AVPlayer still owns `file://` offline + HLS + JioSaavn.
+  - *Resolver (paired):* `YouTubeStreamResolver.vlcDirectLongTrack=true` collapses
+    the long-track chain to ANDROID_VR-first (skips dead HLS hunt) → resolve
+    ~150-255ms vs 4-client ~600-800ms+.
+  - *Affected:* PlayerViewModel — `vlcEngine`/`usingVLC` props, `wireVLCEngine()`,
+    loadCurrentSong VLC branch, volume/playbackSpeed didSet, play/pause/seek/
+    seekToStart/stop routing, observeTimeControl guard. YouTubeStreamResolver —
+    `vlcDirectLongTrack` flag + orderedChain branch. New VLCPlaybackEngine.swift.
+  - *Rollback:* `PlayerViewModel.vlcSmokeTest = false` → AVPlayer faststart path
+    (CP6) returns; `YouTubeStreamResolver.vlcDirectLongTrack = false` → HLS chain.
+    Or `git checkout playback-stable-6 -- .../PlayerViewModel.swift`.
+  - *Status:* awaiting device test — seek (mashup scrub), play/pause correctness,
+    next/prev, lockscreen, **sustained full long mashup** (IP-bound hold on VLC).
+  - *NOT done (next):* CarPlay scrub/now-playing (2c), crossfade (AVPlayer-only),
+    AVPlayer preload/L2 prefetch dormant on VLC path.
 - **CP6 (2026-05-25) — INSTANT START: Fly faststart-remux `/fstream` + app prewarm.**
   - *Root (CP5 proved):* slow readyToPlay = fragmented DASH (AVPlayer scans whole
     file) + worker re-fetch every play. Unfixable app-side.
