@@ -57,6 +57,68 @@ Rollback Checkpoint entry below documenting: current behavior · reason for chan
 (`graphify-out/PLAYBACK_ARCHITECTURE.md`).
 
 ### Rollback checkpoints
+- **CP-RESOLVER-FALLBACK (2026-08-19) — pre-URL resolver total-failure fallback.**
+  - *Symptom:* "Couldn't resolve this track. Try another." — device log showed
+    IOS client returns IP-bound URL (skipped, correct), ANDROID_VR client
+    rejected with "Sign in to confirm you're not a bot", no other client tried
+    → `ALL_CLIENTS_FAILED` thrown from `YouTubeStreamResolver.resolve` inside
+    `loadCurrentSong` BEFORE any URL exists. Confirms the `youtube_ip_bound_all_clients`
+    OPEN item: the existing backend-worker fallback (`swapToBackendYTStream`,
+    used successfully by the post-URL `.failed` KVO branch and CP-SILENT-VLC's
+    VLC watchdog) never ran here because those triggers only fire once VLC/AVPlayer
+    has a URL to fail on — a resolve-time throw has no URL yet, so the app fell
+    straight to a user-facing error with no fallback attempt.
+  - *Fix:* the resolver `catch` block in `loadCurrentSong` (was: set `playbackError`
+    + return) now checks `!backendFallbackUsed` first and calls
+    `swapToBackendYTStream(song:, resumeAt: currentTime)` — same one-shot backend
+    worker proxy path (`api.heyandirect.com/stream?id=yt_<id>`) already proven
+    reliable elsewhere in this file. Only falls through to the error message if
+    the backend fallback was already used this load (matches existing one-shot
+    guard pattern at line ~1328).
+  - *Affected:* one `catch` block only, in the non-preloaded YT resolve branch of
+    `loadCurrentSong` (PlayerViewModel.swift, YT path start / resolver-failure
+    section). No resolver client-chain logic, no VLC engine, no protocol change.
+  - *Rollback:* restore the catch block to unconditionally set `playbackError`
+    and return (drop the `swapToBackendYTStream` call + `backendFallbackUsed`
+    guard); or `git checkout playback-stable-9 -- .../PlayerViewModel.swift`.
+  - *Status:* built for physical device via `xcodebuild` (Xcode 27 beta,
+    DEVELOPER_DIR override) — awaiting device replay of the failing track to
+    confirm audible fallback.
+- **CP-SILENT-VLC (2026-08-19) — no-audio fix: build break + silent VLC failure + dead `/fstream`.**
+  - *Symptom:* press Play → no audio, often no error at all.
+  - *Root causes (3, all verified):*
+    1. **Working tree did not compile.** `PlayerViewModel.swift` L326/L1038 carried
+       raw `\u2192` / `\u23f0` escapes — invalid Swift (only `\u{...}` is legal).
+       `swiftc -frontend -parse` → *"expected hexadecimal code in braces after
+       unicode escape"*. No build could be produced from that tree.
+    2. **VLC path had no failure surface.** VLC owns YT-progressive
+       (`vlcSmokeTest=true`) but has no AVPlayer `.failed` KVO, so a rejected
+       googlevideo fetch was silent — no audio, no error, no fallback, forever.
+       YouTube now signs **every** client's audio URL with `ip=` (verified: all
+       5 IOS audio formats carry it; tampering the param → HTTP 403), so any
+       egress-IP change (Wi-Fi↔LTE, CGNAT, Private Relay) turns playback into a
+       403 the app could not see.
+    3. **Fly `/fstream` is gone** — `GET /fstream?id=yt_…` → **404** (Fly only
+       exposes `/stream` + `/stream/{id}`). The AVPlayer YT-progressive branch
+       and the launch/next-track prewarm were both pointed at that dead route.
+  - *Fix:* (a) fix the invalid escapes; (b) `VLCPlaybackEngine.onError` bridge +
+    `isActuallyPlaying`/`stateDescription` readouts, and
+    `armVLCReadinessWatchdog(song:loadGen:)` — 8s no-audio → `swapToBackendYTStream`;
+    armed from the VLC load AND from `play()` (a paused load never armed one);
+    watchdog asks VLC for real state, not the optimistic `isPlaying`;
+    (c) repoint the `/fstream` branch + `prewarmFstream` at `backendStreamURL`
+    (`api.heyandirect.com/stream?id=yt_<id>` → 302 → Worker → verified 206 audio/mp4).
+  - *Affected:* `VLCPlaybackEngine` (onError, isActuallyPlaying, stateDescription,
+    state-changed bridge); `PlayerViewModel` (wireVLCEngine, failVLCAndFallBackToBackend,
+    armVLCReadinessWatchdog, loadCurrentSong VLC + progressive branches,
+    prewarmFstream, play()). No resolver, UI, queue, or protocol change.
+  - *Rollback:* `git checkout playback-stable-9 -- XCode/Dhunify/Dhunify/Features/Player/PlayerViewModel.swift XCode/Dhunify/Dhunify/Core/Playback/VLCPlaybackEngine.swift`.
+  - *Status:* AWAITING DEVICE TEST — no Xcode on this machine, so only
+    `swiftc -frontend -parse` (clean on all three files) could be run.
+  - *OPEN:* `YouTubeStreamResolver.resolveStable` rejects IP-bound URLs from every
+    client. Now that YouTube IP-binds every client, it **always throws** → the
+    AVPlayer stall-recovery re-resolve is permanently dead. Left untouched
+    (locked resolver logic); needs its own reviewed checkpoint.
 - **CP-VLC-2a (2026-05-26) — VLC engine for YT-progressive (replaces AVPlayer faststart).**
   - *Root:* AVPlayer can't fast-start YouTube's raw fragmented itag139 (scans
     whole moov) — faststart via Fly was ~4-6s. Smoke test proved VLC plays the

@@ -382,18 +382,15 @@ final class YouTubeStreamResolver {
             do {
                 logger.info("🧪 DBG try client=\(client.name, privacy: .public) for \(id, privacy: .public)")
                 let stream = try await fetchStreamUsing(client: client, videoID: id)
-                // Reject IP-bound URLs from IOS — IOS normally returns
-                // IP-neutral URLs, so ip= present means something is off.
-                // ANDROID_VR is the last-resort client and its URLs often
-                // carry ip=; accept it there so we never fail when IOS
-                // couldn't resolve at all.
-                if let ip = ipParam(in: stream.url), client.name != "ANDROID_VR" {
-                    logger.info("🧪 DBG client=\(client.name, privacy: .public) returned IP-bound URL ip=\(ip, privacy: .public) — skipping")
-                    lastError = YouTubeStreamResolverError.playabilityFailed("IP-bound URL")
-                    continue
-                }
+                // IP-bound URLs are fine here: this resolver only feeds the
+                // VLC same-device playback path (YT-progressive is VLC-only
+                // per CP-VLC-2a), so the device that resolves the URL is the
+                // same device that fetches it — no proxy/relay IP mismatch.
+                // Previously IOS's ip=-bound URL was rejected, forcing a
+                // fall-through to ANDROID_VR, which YouTube started
+                // bot-checking — accept IOS's URL like ANDROID_VR already was.
                 if let ip = ipParam(in: stream.url) {
-                    logger.info("🧪 DBG ANDROID_VR accepted with ip=\(ip, privacy: .public) (last-resort)")
+                    logger.info("🧪 DBG client=\(client.name, privacy: .public) accepted with ip=\(ip, privacy: .public) (same-device VLC playback)")
                 }
                 rememberSuccessfulClient(client.name)
                 return stream

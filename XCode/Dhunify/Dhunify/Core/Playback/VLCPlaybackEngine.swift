@@ -30,6 +30,13 @@ final class VLCPlaybackEngine: NSObject, VLCMediaPlayerDelegate {
     var onPlaying: (@MainActor (Bool) -> Void)?
     /// Track reached its natural end — caller advances the queue.
     var onEnded: (@MainActor () -> Void)?
+    /// VLC hit a genuine playback error (bad/blocked URL, network
+    /// failure, unsupported stream). Unlike AVPlayer, VLC has no
+    /// `.failed` KVO the rest of PlayerViewModel already reacts to, so
+    /// without this bridge a VLC-side failure was silent — no audio,
+    /// no error, no fallback. Caller should route to a more resilient
+    /// source (e.g. the backend proxy stream).
+    var onError: (@MainActor () -> Void)?
 
     override init() {
         super.init()
@@ -38,9 +45,19 @@ final class VLCPlaybackEngine: NSObject, VLCMediaPlayerDelegate {
 
     // MARK: - Transport
 
+    // googlevideo validates the byte-fetch User-Agent against the
+    // InnerTube client that resolved the URL. VLC's default UA
+    // (`VLC/x.x LibVLC/x.x`) doesn't match, and the connection just
+    // hangs (no VLC .error, no audio) until the caller's watchdog gives
+    // up. Must match YouTubeStreamResolver's IOS client UA exactly.
+    private static let googlevideoUserAgent =
+        "com.google.ios.youtube/20.14.3 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X)"
+
     func load(url: URL, autoplay: Bool, rate: Float, volume: Float) {
         player.stop()
-        player.media = VLCMedia(url: url)
+        let media = VLCMedia(url: url)
+        media.addOption(":http-user-agent=\(Self.googlevideoUserAgent)")
+        player.media = media
         setVolume(volume)
         Self.log.info("🟣 VLC engine load \(url.host ?? "?", privacy: .public) autoplay=\(autoplay)")
         if autoplay { player.play() }
@@ -69,6 +86,26 @@ final class VLCPlaybackEngine: NSObject, VLCMediaPlayerDelegate {
 
     // MARK: - Readouts
 
+    /// VLC's OWN view of whether audio is flowing. PlayerViewModel's
+    /// `isPlaying` is optimistic (set the instant the user taps Play) and
+    /// survives across loads, so it can't be used to detect a silent
+    /// failure — this can.
+    var isActuallyPlaying: Bool { player.isPlaying }
+
+    /// Raw VLC state, for diagnostics on a failed/stalled load.
+    var stateDescription: String {
+        switch player.state {
+        case .stopped: return "stopped"
+        case .opening: return "opening"
+        case .buffering: return "buffering"
+        case .ended: return "ended"
+        case .error: return "error"
+        case .playing: return "playing"
+        case .paused: return "paused"
+        default: return "other(\(player.state.rawValue))"
+        }
+    }
+
     private var currentSeconds: Double { Double(player.time.intValue) / 1000.0 }
 
     private var durationSeconds: Double {
@@ -81,9 +118,11 @@ final class VLCPlaybackEngine: NSObject, VLCMediaPlayerDelegate {
     func mediaPlayerStateChanged(_ aNotification: Notification) {
         let playing = player.isPlaying
         let ended = player.state == .ended
+        let errored = player.state == .error
         Task { @MainActor in
             self.onPlaying?(playing)
             if ended { self.onEnded?() }
+            if errored { self.onError?() }
         }
     }
 

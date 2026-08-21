@@ -321,6 +321,50 @@ final class PlayerViewModel {
                 self.nextTrack()
             }
         }
+        vlcEngine.onError = { [weak self] in
+            guard let self, self.usingVLC, let song = self.currentSong else { return }
+            Self.logger.error("🟣 VLC engine reported .error → falling back to backend stream")
+            self.failVLCAndFallBackToBackend(song: song)
+        }
+    }
+
+    /// Tears down the VLC engine and swaps to the reliable backend proxy
+    /// stream via AVPlayer. Shared by the VLC `.error` bridge and the
+    /// readiness watchdog so a VLC-side failure (silent or reported)
+    /// always ends in audible playback instead of dead silence.
+    /// Idempotent per load via `backendFallbackUsed`.
+    private func failVLCAndFallBackToBackend(song: Song) {
+        guard !backendFallbackUsed else { return }
+        usingVLC = false
+        vlcEngine.stop()
+        isBuffering = true
+        swapToBackendYTStream(song: song, resumeAt: currentTime)
+    }
+
+    /// Readiness watchdog for the VLC path. VLC's direct googlevideo fetch
+    /// can fail *silently*: the URL is signed for the egress IP that
+    /// resolved it, so any IP change (Wi-Fi↔LTE, CGNAT, Private Relay) or
+    /// an expired `expire=` makes the CDN answer 403 and VLC just sits
+    /// there — no `.error` state, no AVPlayer `.failed` KVO, no error UI.
+    /// That is a dead Play button with no audio and no message.
+    ///
+    /// If playback hasn't actually started within 8s, fall back to the
+    /// backend proxy stream (server egress IP → never IP-bound) so the
+    /// user always ends up with audio. Guarded on the load generation and
+    /// `usingVLC` so a superseded load, an AVPlayer load, or playback that
+    /// already started cannot be disturbed.
+    private func armVLCReadinessWatchdog(song: Song, loadGen: Int) {
+        unknownStatusWatchdog?.cancel()
+        unknownStatusWatchdog = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            // `isPlaying` is optimistic (set on tap, kept across loads),
+            // so ask VLC itself whether audio is actually flowing.
+            guard loadGen == self.loadToken, self.usingVLC, self.wantsToPlay,
+                  !self.vlcEngine.isActuallyPlaying else { return }
+            Self.logger.error("⏰ VLC readiness watchdog → no playback after 8s (vlcState=\(self.vlcEngine.stateDescription, privacy: .public)), falling back to backend")
+            self.failVLCAndFallBackToBackend(song: song)
+        }
     }
 
     func setQueue(_ queue: [Song], startIndex: Int, categorySeed: String? = nil) {
@@ -926,14 +970,23 @@ final class PlayerViewModel {
                     } catch {
                         let nse = error as NSError
                         Self.logger.error("🧪 DBG YT resolver FAILED domain=\(nse.domain) code=\(nse.code) desc=\(error.localizedDescription)")
-                        playbackError = "Couldn't resolve this track. Try another."
-                        isLoadingItem = false
-                        loadingSongID = nil
-                        self.clearPlayFeedback(animated: false)
                         preloadedURL = nil
                         preloadedSongID = nil
                         preloadedYTFallback = nil
                         preloadedYTDuration = nil
+                        // All on-device InnerTube clients failed pre-URL (e.g. bot-check,
+                        // IP-bound on every client) — same recoverable case the .failed
+                        // KVO branch handles post-URL. Route to the same one-shot backend
+                        // worker fallback instead of surfacing an error the user can't act on.
+                        if !backendFallbackUsed {
+                            Self.logger.info("🎵 YT resolver total failure → backend yt-dlp fallback")
+                            swapToBackendYTStream(song: song, resumeAt: currentTime)
+                            return
+                        }
+                        playbackError = "Couldn't resolve this track. Try another."
+                        isLoadingItem = false
+                        loadingSongID = nil
+                        self.clearPlayFeedback(animated: false)
                         return
                     }
                     preloadedURL = nil
@@ -1001,6 +1054,10 @@ final class PlayerViewModel {
                 self.loadingSongID = nil
                 self.setupNowPlaying()
                 Self.logger.info("🟣 VLC engine playing id=\(song.youtubeID, privacy: .public) dur=\(Int(dur))s autoplay=\(self.wantsToPlay)")
+
+                if self.wantsToPlay {
+                    self.armVLCReadinessWatchdog(song: song, loadGen: loadGen)
+                }
                 return
             }
             var useResourceLoader = false
@@ -1019,15 +1076,17 @@ final class PlayerViewModel {
                 useResourceLoader = true
                 Self.logger.info("🧪 ResourceLoader playback id=\(song.youtubeID, privacy: .public) clen=\(clen)")
             } else if song.isYouTubeSource, !finalURL.isFileURL,
-               let fstreamURL = Self.fstreamURL(youtubeID: song.youtubeID) {
-                // Faststart: Fly returns a moov-at-front progressive MP4 (whole
-                // file). AVPlayer plays + byte-range SEEKS it freely (scrub works
-                // across the whole mashup). Cold = build (~3-5s typical on the
-                // 4-CPU box, longer for 2hr mixes); prewarmed/replayed instant.
-                // (BHLS gave instant-start but AVPlayer wouldn't seek it.)
-                // `.failed`/watchdog fall back to the worker (swapToBackendYTStream).
-                Self.logger.info("⚡️ Faststart playback id=\(song.youtubeID, privacy: .public) → \(fstreamURL.absoluteString, privacy: .public)")
-                finalURL = fstreamURL
+               let backendURL = Self.backendStreamURL(youtubeID: song.youtubeID) {
+                // Fly's faststart route (`/fstream`) NO LONGER EXISTS — it
+                // answers 404 (verified 2026-08-19), so handing AVPlayer that
+                // URL guaranteed a `.failed` item on every YouTube load that
+                // reaches this branch. Use the backend stream instead: it
+                // 302s to the Cloudflare Worker, which serves range-correct
+                // audio/mp4 from its own egress IP (verified 206). Same
+                // reliable source `swapToBackendYTStream` already falls back
+                // to, so behaviour is unchanged apart from actually working.
+                Self.logger.info("⚡️ Backend progressive playback id=\(song.youtubeID, privacy: .public) → \(backendURL.absoluteString, privacy: .public)")
+                finalURL = backendURL
             } else if Self.relayPlaybackMode, song.isYouTubeSource, !finalURL.isFileURL,
                       let relayURL = Self.relayStreamURL(youtubeID: song.youtubeID) {
                 Self.logger.info("🔀 Relay playback id=\(song.youtubeID, privacy: .public) → \(relayURL.absoluteString, privacy: .public)")
@@ -1799,6 +1858,18 @@ final class PlayerViewModel {
                 case .failed:
                     let err = playerItem.error?.localizedDescription ?? "unknown"
                     Self.logger.error("🎵 [backend-fallback] FAILED: \(err)")
+                    // TEMP DIAGNOSTIC (CP-RESOLVER-FALLBACK follow-up) — capture
+                    // exact NSError domain/code so "Operation Stopped" (an
+                    // ambiguous localizedDescription) can be traced to its real
+                    // source (URLSession cancel/timeout/reset vs app-side
+                    // cancellation). Behavior-free; remove once diagnosed.
+                    if let nse = playerItem.error as NSError? {
+                        Self.logger.error("🧪 DBG backend-fallback error domain=\(nse.domain) code=\(nse.code) userInfo=\(nse.userInfo)")
+                        if let underlying = nse.userInfo[NSUnderlyingErrorKey] as? NSError {
+                            Self.logger.error("🧪 DBG backend-fallback underlying domain=\(underlying.domain) code=\(underlying.code) desc=\(underlying.localizedDescription)")
+                        }
+                    }
+                    Self.logger.error("🧪 DBG backend-fallback loadGen(captured)=\(loadGen) loadToken(current)=\(self.loadToken) itemIsCurrent=\(playerItem === self.player.currentItem) song=\(song.title)")
                     self.playbackError = err
                     self.isBuffering = false
                     self.isPlaying = false
@@ -2046,14 +2117,18 @@ final class PlayerViewModel {
     func prewarmFstream(youtubeID rawID: String) {
         let id = rawID.hasPrefix("yt_") ? rawID : "yt_\(rawID)"
         guard fstreamPrewarmedIDs.insert(id).inserted,
-              let url = Self.fstreamURL(youtubeID: id) else { return }
-        // GET the faststart URL → Fly pre-builds (download+remux) the next track
-        // so the tap is an instant cache hit. Best-effort, no player mutation.
+              let url = Self.backendStreamURL(youtubeID: id) else { return }
+        // Fly's `/fstream` build route is gone (404), so there is no remux to
+        // trigger any more. Warm the backend/Worker edge cache instead with a
+        // small ranged GET — enough to make the Worker resolve + cache the
+        // upstream URL, without pulling a whole track over cellular.
+        // Best-effort, detached, no player mutation.
         var req = URLRequest(url: url)
-        req.timeoutInterval = 90
+        req.timeoutInterval = 20
+        req.setValue("bytes=0-65535", forHTTPHeaderField: "Range")
         Task.detached(priority: .utility) {
             _ = try? await URLSession.shared.data(for: req)
-            Self.logger.info("⚡️ fstream prewarm \(id, privacy: .public)")
+            Self.logger.info("⚡️ backend prewarm \(id, privacy: .public)")
         }
     }
 
@@ -2786,6 +2861,13 @@ final class PlayerViewModel {
             isPlaying = true
             clearPlayFeedback()
             updateNowPlayingPlaybackState()
+            // A track loaded while paused never armed the readiness
+            // watchdog (it only arms when the load itself autoplays), so
+            // a silent VLC failure here would leave the user with a dead
+            // Play button forever. Arm it on the press instead.
+            if let song = currentSong {
+                armVLCReadinessWatchdog(song: song, loadGen: loadToken)
+            }
             return
         }
 
